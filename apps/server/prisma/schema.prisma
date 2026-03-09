@@ -1,0 +1,230 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  owner
+  maintainer
+  viewer
+}
+
+enum RunStatus {
+  pending
+  running
+  succeeded
+  failed
+}
+
+enum JobType {
+  shell
+  prompt
+}
+
+model SystemSetting {
+  key       String   @id
+  value     String
+  updatedAt DateTime @updatedAt
+}
+
+model User {
+  id           String        @id @default(cuid())
+  email        String        @unique
+  passwordHash String
+  createdAt    DateTime      @default(now())
+  memberships  Membership[]
+  sessions     Session[]     @relation("SessionOwner")
+  messages     Message[]
+  auditEvents  AuditEvent[]
+  authSessions AuthSession[]
+}
+
+model Workspace {
+  id          String        @id @default(cuid())
+  name        String
+  createdAt   DateTime      @default(now())
+  memberships Membership[]
+  projects    Project[]
+  sessions    Session[]
+  invites     Invite[]
+}
+
+model Membership {
+  id          String     @id @default(cuid())
+  role        Role
+  userId      String
+  workspaceId String
+  createdAt   DateTime   @default(now())
+  user        User       @relation(fields: [userId], references: [id])
+  workspace   Workspace  @relation(fields: [workspaceId], references: [id])
+
+  @@unique([userId, workspaceId])
+}
+
+model Invite {
+  id          String    @id @default(cuid())
+  token       String    @unique
+  role        Role
+  workspaceId String
+  email       String?
+  expiresAt   DateTime
+  acceptedAt  DateTime?
+  acceptedById String?
+  createdAt   DateTime  @default(now())
+  workspace   Workspace @relation(fields: [workspaceId], references: [id])
+}
+
+model Project {
+  id               String     @id @default(cuid())
+  name             String
+  workspaceId      String
+  repoUrl          String?
+  githubInstallId  String?
+  createdAt        DateTime   @default(now())
+  workspace        Workspace  @relation(fields: [workspaceId], references: [id])
+  sessions         Session[]
+  worktrees        Worktree[]
+  sandboxes        Sandbox[]
+  gitRepos         GitRepo[]
+  schedules        Schedule[]
+}
+
+model Session {
+  id          String     @id @default(cuid())
+  title       String?
+  workspaceId String
+  projectId   String?
+  ownerId     String
+  createdAt   DateTime   @default(now())
+  workspace   Workspace  @relation(fields: [workspaceId], references: [id])
+  project     Project?   @relation(fields: [projectId], references: [id])
+  owner       User       @relation("SessionOwner", fields: [ownerId], references: [id])
+  messages    Message[]
+  agentRuns   AgentRun[]
+}
+
+model Message {
+  id        String   @id @default(cuid())
+  sessionId String
+  authorId  String
+  role      String
+  content   String
+  createdAt DateTime @default(now())
+  session   Session  @relation(fields: [sessionId], references: [id])
+  author    User     @relation(fields: [authorId], references: [id])
+}
+
+model Worktree {
+  id         String   @id @default(cuid())
+  projectId  String
+  sessionId  String?
+  path       String
+  branch     String
+  createdAt  DateTime @default(now())
+  project    Project  @relation(fields: [projectId], references: [id])
+}
+
+model Sandbox {
+  id         String   @id @default(cuid())
+  projectId  String
+  sessionId  String?
+  container  String
+  status     String
+  createdAt  DateTime @default(now())
+  project    Project  @relation(fields: [projectId], references: [id])
+}
+
+model GitRepo {
+  id         String   @id @default(cuid())
+  projectId  String
+  provider   String
+  repoUrl    String
+  createdAt  DateTime @default(now())
+  project    Project  @relation(fields: [projectId], references: [id])
+  gitChecks  GitCheck[]
+}
+
+model GitCheck {
+  id         String   @id @default(cuid())
+  repoId     String
+  name       String
+  status     String
+  conclusion String?
+  startedAt  DateTime?
+  endedAt    DateTime?
+  repo       GitRepo  @relation(fields: [repoId], references: [id])
+}
+
+model Schedule {
+  id         String   @id @default(cuid())
+  projectId  String
+  name       String
+  cron       String
+  jobType    JobType
+  payload    String
+  enabled    Boolean  @default(true)
+  createdAt  DateTime @default(now())
+  project    Project  @relation(fields: [projectId], references: [id])
+  jobRuns    JobRun[]
+}
+
+model JobRun {
+  id         String   @id @default(cuid())
+  scheduleId String
+  status     RunStatus
+  startedAt  DateTime?
+  endedAt    DateTime?
+  logs       String?
+  schedule   Schedule @relation(fields: [scheduleId], references: [id])
+}
+
+model AgentRun {
+  id         String    @id @default(cuid())
+  sessionId  String
+  status     RunStatus
+  createdAt  DateTime  @default(now())
+  session    Session   @relation(fields: [sessionId], references: [id])
+  toolCalls  ToolCall[]
+  artifacts  Artifact[]
+}
+
+model ToolCall {
+  id         String   @id @default(cuid())
+  agentRunId String
+  name       String
+  input      String
+  output     String?
+  durationMs Int?
+  agentRun   AgentRun @relation(fields: [agentRunId], references: [id])
+}
+
+model Artifact {
+  id         String   @id @default(cuid())
+  agentRunId String
+  name       String
+  path       String
+  createdAt  DateTime @default(now())
+  agentRun   AgentRun @relation(fields: [agentRunId], references: [id])
+}
+
+model AuditEvent {
+  id        String   @id @default(cuid())
+  actorId   String
+  action    String
+  target    String
+  createdAt DateTime @default(now())
+  actor     User     @relation(fields: [actorId], references: [id])
+}
+
+model AuthSession {
+  id        String   @id @default(cuid())
+  token     String   @unique
+  userId    String
+  createdAt DateTime @default(now())
+  expiresAt DateTime
+  user      User     @relation(fields: [userId], references: [id])
+}

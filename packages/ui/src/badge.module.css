@@ -1,0 +1,30 @@
+.base {
+  display: inline-flex;
+  align-items: center;
+  padding: 4px 10px;
+  border-radius: 999px;
+  font-family: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+
+.neutral {
+  background: #efe7de;
+  color: #5a4f48;
+}
+
+.success {
+  background: #e3f2e9;
+  color: #2e6b49;
+}
+
+.warning {
+  background: #fff1d6;
+  color: #8a5a1a;
+}
+
+.danger {
+  background: #fde5e5;
+  color: #7b2b2b;
+}

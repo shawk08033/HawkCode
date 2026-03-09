@@ -1,0 +1,51 @@
+.backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(7, 10, 9, 0.65);
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  z-index: 50;
+}
+
+.modal {
+  width: min(520px, 90vw);
+  background: #101413;
+  border-radius: 20px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+  padding: 20px 20px 16px;
+  border: 1px solid rgba(68, 90, 79, 0.6);
+}
+
+.header {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: flex-start;
+}
+
+.title {
+  margin: 0 0 6px;
+  font-family: "Space Grotesk", "Segoe UI", sans-serif;
+  font-size: 20px;
+  color: #e7ece8;
+}
+
+.description {
+  margin: 0;
+  color: #a4b6ad;
+  font-family: "Space Grotesk", "Segoe UI", sans-serif;
+  font-size: 14px;
+}
+
+.close {
+  border: none;
+  background: transparent;
+  font-size: 24px;
+  cursor: pointer;
+  color: #a4b6ad;
+}
+
+.body {
+  margin-top: 16px;
+}
