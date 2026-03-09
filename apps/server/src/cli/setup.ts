@@ -101,6 +101,18 @@ async function promptForConfig(nonInteractive: boolean) {
       name: "githubAppKeyPath",
       message: "GitHub App private key path (optional)",
       initial: getEnvValue("GITHUB_APP_KEY_PATH") ?? ""
+    },
+    {
+      type: "text",
+      name: "tlsCertPath",
+      message: "TLS certificate path (optional)",
+      initial: getEnvValue("HAWKCODE_TLS_CERT_PATH") ?? ""
+    },
+    {
+      type: "text",
+      name: "tlsKeyPath",
+      message: "TLS key path (optional)",
+      initial: getEnvValue("HAWKCODE_TLS_KEY_PATH") ?? ""
     }
   ]);
 
@@ -112,7 +124,9 @@ async function promptForConfig(nonInteractive: boolean) {
     databaseUrl: cleanValue(response.databaseUrl),
     redisUrl: cleanValue(response.redisUrl),
     githubAppId: cleanValue(response.githubAppId),
-    githubAppKeyPath: cleanValue(response.githubAppKeyPath)
+    githubAppKeyPath: cleanValue(response.githubAppKeyPath),
+    tlsCertPath: cleanValue(response.tlsCertPath),
+    tlsKeyPath: cleanValue(response.tlsKeyPath)
   });
 }
 
@@ -220,12 +234,16 @@ function writeConfigFile(config: {
   dbProvider: string;
   databaseUrl: string;
   redisUrl?: string;
+  tlsCertPath?: string;
+  tlsKeyPath?: string;
 }) {
   const configPath = resolveConfigPath();
   const payload = {
     dbProvider: config.dbProvider,
     databaseUrl: config.databaseUrl,
-    ...(config.redisUrl ? { redisUrl: config.redisUrl } : {})
+    ...(config.redisUrl ? { redisUrl: config.redisUrl } : {}),
+    ...(config.tlsCertPath ? { tlsCertPath: config.tlsCertPath } : {}),
+    ...(config.tlsKeyPath ? { tlsKeyPath: config.tlsKeyPath } : {})
   };
   fs.writeFileSync(configPath, `${JSON.stringify(payload, null, 2)}\n`, "utf8");
 }
@@ -340,7 +358,9 @@ async function main() {
     writeConfigFile({
       dbProvider: config.dbProvider,
       databaseUrl: config.databaseUrl,
-      redisUrl: config.redisUrl
+      redisUrl: config.redisUrl,
+      tlsCertPath: config.tlsCertPath,
+      tlsKeyPath: config.tlsKeyPath
     });
   }
 

@@ -1,8 +1,14 @@
-import { app, BrowserWindow, ipcMain, net } from "electron";
+import { app, BrowserWindow, ipcMain, net, session } from "electron";
 import path from "node:path";
 import Store from "electron-store";
 
 const isDev = !app.isPackaged;
+const allowSelfSigned = isDev;
+
+if (allowSelfSigned) {
+  app.commandLine.appendSwitch("ignore-certificate-errors");
+  app.commandLine.appendSwitch("allow-insecure-localhost", "true");
+}
 
 type StoreShape = {
   serverUrl?: string;
@@ -21,6 +27,11 @@ const store = new Store<StoreShape>({
     trustedCerts: {}
   }
 });
+
+const devServerUrl = isDev ? process.env.HAWKCODE_SERVER_URL?.trim() : undefined;
+if (devServerUrl) {
+  store.set("serverUrl", devServerUrl.replace(/\/$/, ""));
+}
 
 const pendingCerts = new Map<string, PendingCert>();
 
@@ -69,10 +80,20 @@ async function checkHealth(url: string) {
 }
 
 app.whenReady().then(() => {
+  if (allowSelfSigned) {
+    session.defaultSession.setCertificateVerifyProc((_request, callback) => {
+      callback(0);
+    });
+  }
   app.on(
     "certificate-error",
     (event, _webContents, url, _error, certificate, callback) => {
       const hostname = new URL(url).hostname;
+      if (allowSelfSigned) {
+        event.preventDefault();
+        callback(true);
+        return;
+      }
       const trusted = store.get("trustedCerts") ?? {};
       if (trusted[hostname] === certificate.fingerprint) {
         event.preventDefault();

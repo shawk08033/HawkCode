@@ -10,6 +10,7 @@ apps/desktop/out/
 .env
 .env.*
 hawkcode.config.json
+certs/
 *.log
 prisma/dev.db
 prisma/dev.db-journal

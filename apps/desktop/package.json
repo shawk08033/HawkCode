@@ -2,25 +2,38 @@
   "name": "@hawkcode/desktop",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
   "main": "dist/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",
+    "dev:with-server": "pnpm -C ../server dev & pnpm -C ../worker dev & HAWKCODE_SERVER_URL=http://localhost:3001 HAWKCODE_DESKTOP_TRUST_SELF_SIGNED=1 electron-vite dev",
     "build": "electron-vite build",
     "lint": "echo 'no lint yet'",
     "typecheck": "tsc -p tsconfig.json --noEmit"
   },
   "dependencies": {
     "@hawkcode/ui": "workspace:*",
+    "@radix-ui/react-separator": "^1.1.8",
+    "@radix-ui/react-slot": "^1.2.4",
+    "@radix-ui/react-tabs": "^1.1.13",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
     "electron-store": "^8.2.0",
     "react": "^18.3.1",
-    "react-dom": "^18.3.1"
+    "react-dom": "^18.3.1",
+    "tailwind-merge": "^3.5.0",
+    "tailwindcss-animate": "^1.0.7"
   },
   "devDependencies": {
+    "@tailwindcss/postcss": "^4.2.1",
     "@types/node": "^20.14.15",
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
+    "autoprefixer": "^10.4.27",
     "electron": "^31.3.1",
     "electron-vite": "^2.3.0",
+    "postcss": "^8.5.8",
+    "tailwindcss": "^4.2.1",
     "typescript": "^5.5.4"
   }
 }
