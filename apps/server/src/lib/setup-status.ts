@@ -1,13 +1,13 @@
 const SETUP_KEY = "setupComplete";
 
 export async function getSetupComplete(): Promise<boolean> {
-  const { loadRuntimeConfig } = await import("./runtime-config");
+  const { loadRuntimeConfig } = await import("./runtime-config.js");
   const config = loadRuntimeConfig();
   if (!config?.databaseUrl) {
     return false;
   }
   try {
-    const { prisma } = await import("./prisma");
+    const { prisma } = await import("./prisma.js");
     const setting = await prisma.systemSetting.findUnique({
       where: { key: SETUP_KEY }
     });
@@ -18,7 +18,7 @@ export async function getSetupComplete(): Promise<boolean> {
 }
 
 export async function setSetupComplete(value: boolean): Promise<void> {
-  const { prisma } = await import("./prisma");
+  const { prisma } = await import("./prisma.js");
   await prisma.systemSetting.upsert({
     where: { key: SETUP_KEY },
     update: { value: value ? "true" : "false" },

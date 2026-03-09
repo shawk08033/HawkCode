@@ -6,6 +6,13 @@ const configSchema = z.object({
   databaseUrl: z.string().min(1),
   dbProvider: z.enum(["postgresql", "sqlite"]),
   redisUrl: z.string().optional(),
+  codexPath: z.string().optional(),
+  codexModel: z.string().optional(),
+  openrouterApiKey: z.string().optional(),
+  openrouterBaseUrl: z.string().optional(),
+  openrouterModel: z.string().optional(),
+  openrouterSiteUrl: z.string().optional(),
+  openrouterAppName: z.string().optional(),
   tlsCertPath: z.string().optional(),
   tlsKeyPath: z.string().optional()
 });

@@ -1,5 +1,5 @@
 import { PrismaClient } from "@prisma/client";
-import { loadRuntimeConfig } from "./runtime-config";
+import { loadRuntimeConfig } from "./runtime-config.js";
 
 const config = loadRuntimeConfig();
 if (config?.databaseUrl) {

@@ -3,9 +3,11 @@ import Fastify from "fastify";
 import cookie from "@fastify/cookie";
 import cors from "@fastify/cors";
 import websocket from "@fastify/websocket";
-import { getSetupComplete } from "./lib/setup-status";
-import { registerAuthRoutes } from "./routes/auth";
-import { loadRuntimeConfig } from "./lib/runtime-config";
+import { getSetupComplete } from "./lib/setup-status.js";
+import { registerAuthRoutes } from "./routes/auth.js";
+import { registerAgentRoutes } from "./routes/agents.js";
+import { registerWorkspaceRoutes } from "./routes/workspaces.js";
+import { loadRuntimeConfig } from "./lib/runtime-config.js";
 import fs from "node:fs";
 
 const runtimeConfig = loadRuntimeConfig();
@@ -54,6 +56,8 @@ server.get("/setup/status", async () => {
 });
 
 await registerAuthRoutes(server);
+await registerAgentRoutes(server);
+await registerWorkspaceRoutes(server);
 
 const port = Number(process.env.PORT ?? 3001);
 const host = process.env.HOST ?? "0.0.0.0";

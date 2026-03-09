@@ -2,11 +2,13 @@
   "name": "@hawkcode/agent",
   "version": "0.1.0",
   "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
   "main": "src/index.ts",
   "types": "src/index.ts",
   "scripts": {
     "lint": "echo 'no lint yet'",
-    "typecheck": "tsc -p tsconfig.json"
+    "typecheck": "../../apps/server/node_modules/.bin/tsc -p tsconfig.json"
   },
   "dependencies": {
     "@hawkcode/shared": "workspace:*"
