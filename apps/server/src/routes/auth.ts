@@ -2,6 +2,7 @@ import { FastifyInstance } from "fastify";
 import bcrypt from "bcryptjs";
 import crypto from "node:crypto";
 import { prisma } from "../lib/prisma";
+import { loadRuntimeConfig } from "../lib/runtime-config";
 
 type LoginBody = {
   email: string;
@@ -21,6 +22,18 @@ type CreateInviteBody = {
 };
 
 const SESSION_TTL_DAYS = 30;
+
+function getCookieOptions(expiresAt?: Date) {
+  const runtime = loadRuntimeConfig();
+  const hasTls = Boolean(runtime?.tlsCertPath && runtime?.tlsKeyPath);
+  return {
+    path: "/",
+    httpOnly: true,
+    sameSite: hasTls ? ("none" as const) : ("lax" as const),
+    secure: hasTls,
+    ...(expiresAt ? { expires: expiresAt } : {})
+  };
+}
 
 function createToken() {
   return crypto.randomBytes(32).toString("hex");
@@ -86,13 +99,7 @@ export async function registerAuthRoutes(server: FastifyInstance) {
       }
     });
 
-    reply.setCookie("hawkcode_session", token, {
-      path: "/",
-      httpOnly: true,
-      sameSite: "none",
-      secure: true,
-      expires: expiresAt
-    });
+    reply.setCookie("hawkcode_session", token, getCookieOptions(expiresAt));
 
     return reply.send({
       user: { id: user.id, email: user.email }
@@ -143,13 +150,7 @@ export async function registerAuthRoutes(server: FastifyInstance) {
         return user;
       });
 
-      reply.setCookie("hawkcode_session", tokenValue, {
-        path: "/",
-        httpOnly: true,
-        sameSite: "none",
-        secure: true,
-        expires: expiresAt
-      });
+      reply.setCookie("hawkcode_session", tokenValue, getCookieOptions(expiresAt));
 
       return reply.send({ user: { id: result.id, email: result.email } });
     }

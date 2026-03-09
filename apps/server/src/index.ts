@@ -5,8 +5,25 @@ import cors from "@fastify/cors";
 import websocket from "@fastify/websocket";
 import { getSetupComplete } from "./lib/setup-status";
 import { registerAuthRoutes } from "./routes/auth";
+import { loadRuntimeConfig } from "./lib/runtime-config";
+import fs from "node:fs";
 
-const server = Fastify({ logger: true });
+const runtimeConfig = loadRuntimeConfig();
+let httpsConfig = {} as { https?: { cert: Buffer; key: Buffer } };
+if (runtimeConfig?.tlsCertPath && runtimeConfig?.tlsKeyPath) {
+  try {
+    httpsConfig = {
+      https: {
+        cert: fs.readFileSync(runtimeConfig.tlsCertPath),
+        key: fs.readFileSync(runtimeConfig.tlsKeyPath)
+      }
+    };
+  } catch (error) {
+    console.warn("TLS cert/key load failed, starting without HTTPS", error);
+  }
+}
+
+const server = Fastify({ logger: true, ...httpsConfig });
 
 await server.register(cookie);
 await server.register(cors, {

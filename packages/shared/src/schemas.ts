@@ -8,7 +8,9 @@ export const setupConfigSchema = z.object({
   databaseUrl: z.string().min(1),
   redisUrl: z.string().optional(),
   githubAppId: z.string().optional(),
-  githubAppKeyPath: z.string().optional()
+  githubAppKeyPath: z.string().optional(),
+  tlsCertPath: z.string().optional(),
+  tlsKeyPath: z.string().optional()
 });
 
 export type SetupConfig = z.infer<typeof setupConfigSchema>;

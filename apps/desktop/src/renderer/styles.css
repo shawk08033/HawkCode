@@ -1,102 +1,33 @@
-* {
-  box-sizing: border-box;
+@import "tailwindcss";
+@config "../../tailwind.config.ts";
+
+:root {
+  --background: 150 18% 6%;
+  --foreground: 140 30% 92%;
+  --card: 150 20% 9%;
+  --card-foreground: 140 30% 92%;
+  --popover: 150 20% 9%;
+  --popover-foreground: 140 30% 92%;
+  --primary: 144 65% 53%;
+  --primary-foreground: 150 20% 10%;
+  --secondary: 150 20% 12%;
+  --secondary-foreground: 140 30% 92%;
+  --muted: 150 20% 14%;
+  --muted-foreground: 140 8% 70%;
+  --accent: 150 20% 14%;
+  --accent-foreground: 140 30% 92%;
+  --destructive: 0 70% 55%;
+  --destructive-foreground: 0 0% 100%;
+  --border: 150 12% 24%;
+  --input: 150 12% 24%;
+  --ring: 144 65% 53%;
+  --radius: 10px;
 }
 
-body {
-  margin: 0;
-  color: #111;
-  background: radial-gradient(circle at top, #eae6df, #f6f3ee);
-}
-
-.shell {
-  min-height: 100vh;
-  display: grid;
-  gap: 32px;
-  padding: 60px 24px 80px;
-}
-
-.hero {
-  max-width: 720px;
-  display: grid;
-  gap: 20px;
-}
-
-.header h1 {
-  margin: 12px 0 12px;
-  font-size: clamp(32px, 4vw, 48px);
-}
-
-.header p {
-  margin: 0;
-  font-size: 18px;
-  line-height: 1.6;
-  color: #3c332c;
-}
-
-.actions {
-  display: flex;
-  gap: 12px;
-  flex-wrap: wrap;
-}
-
-.grid {
-  display: grid;
-  gap: 20px;
-  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-}
-
-.stack {
-  display: grid;
-  gap: 16px;
-}
-
-.status {
-  display: grid;
-  gap: 8px;
-  font-size: 14px;
-  color: #3c332c;
-}
-
-.error {
-  color: #7b2b2b;
-}
-
-.warning {
-  color: #8a5a1a;
-}
-
-.time {
-  font-size: 12px;
-  color: #776a62;
-}
-
-.invite-list {
-  display: grid;
-  gap: 12px;
-}
-
-.invite-row {
-  display: grid;
-  gap: 6px;
-  padding: 12px;
-  border-radius: 12px;
-  background: rgba(255, 255, 255, 0.6);
-  border: 1px solid #eadfd6;
-}
-
-.invite-main {
-  display: flex;
-  justify-content: space-between;
-  gap: 12px;
-}
-
-.invite-actions {
-  display: grid;
-  gap: 8px;
-}
-
-.filters {
-  display: grid;
-  gap: 12px;
-  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+@layer base {
+  body {
+    background: hsl(var(--background));
+    color: hsl(var(--foreground));
+    font-family: "Space Grotesk", "Segoe UI", sans-serif;
+  }
 }
