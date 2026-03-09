@@ -3,15 +3,22 @@ import { resolve } from "node:path";
 
 export default defineConfig({
   main: {
-    entry: resolve(__dirname, "src/main/index.ts"),
     build: {
-      outDir: resolve(__dirname, "dist/main")
+      outDir: resolve(__dirname, "dist/main"),
+      lib: {
+        entry: resolve(__dirname, "src/main/index.ts"),
+        formats: ["es"]
+      }
     }
   },
   preload: {
-    entry: resolve(__dirname, "src/preload/index.ts"),
     build: {
-      outDir: resolve(__dirname, "dist/preload")
+      outDir: resolve(__dirname, "dist/preload"),
+      lib: {
+        entry: resolve(__dirname, "src/preload/index.ts"),
+        fileName: () => "index.cjs",
+        formats: ["cjs"]
+      }
     }
   },
   renderer: {

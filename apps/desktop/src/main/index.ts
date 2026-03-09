@@ -1,5 +1,6 @@
 import { app, BrowserWindow, ipcMain, net, session } from "electron";
 import path from "node:path";
+import fs from "node:fs";
 import Store from "electron-store";
 
 const isDev = !app.isPackaged;
@@ -18,8 +19,8 @@ type StoreShape = {
 type PendingCert = {
   fingerprint: string;
   issuerName?: string;
-  validStart?: string;
-  validExpiry?: string;
+  validStart?: number;
+  validExpiry?: number;
 };
 
 const store = new Store<StoreShape>({
@@ -36,12 +37,19 @@ if (devServerUrl) {
 const pendingCerts = new Map<string, PendingCert>();
 
 function createWindow() {
+  const preloadPathCjs = path.join(__dirname, "../preload/index.cjs");
+  const preloadPathMjs = path.join(__dirname, "../preload/index.mjs");
+  const preloadPathJs = path.join(__dirname, "../preload/index.js");
   const mainWindow = new BrowserWindow({
     width: 1280,
     height: 800,
     backgroundColor: "#f6f3ee",
     webPreferences: {
-      preload: path.join(__dirname, "../preload/index.js")
+      preload: fs.existsSync(preloadPathCjs)
+        ? preloadPathCjs
+        : fs.existsSync(preloadPathMjs)
+        ? preloadPathMjs
+        : preloadPathJs
     }
   });
 
