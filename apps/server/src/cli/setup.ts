@@ -47,13 +47,13 @@ async function promptForConfig(nonInteractive: boolean) {
       redisUrl: cleanValue(getEnvValue("REDIS_URL")),
       githubAppId: cleanValue(getEnvValue("GITHUB_APP_ID")),
       githubAppKeyPath: cleanValue(getEnvValue("GITHUB_APP_KEY_PATH")),
-      codexPath: cleanValue(getEnvValue("CODEX_PATH")),
-      codexModel: cleanValue(getEnvValue("CODEX_MODEL")),
-      openrouterApiKey: cleanValue(getEnvValue("OPENROUTER_API_KEY")),
-      openrouterBaseUrl: cleanValue(getEnvValue("OPENROUTER_BASE_URL")),
-      openrouterModel: cleanValue(getEnvValue("OPENROUTER_MODEL")),
-      openrouterSiteUrl: cleanValue(getEnvValue("OPENROUTER_SITE_URL")),
-      openrouterAppName: cleanValue(getEnvValue("OPENROUTER_APP_NAME"))
+      codexPath: undefined,
+      codexModel: undefined,
+      openrouterApiKey: undefined,
+      openrouterBaseUrl: undefined,
+      openrouterModel: undefined,
+      openrouterSiteUrl: undefined,
+      openrouterAppName: undefined
     });
   }
 
@@ -114,37 +114,37 @@ async function promptForConfig(nonInteractive: boolean) {
       type: "text",
       name: "codexPath",
       message: "Codex CLI path (optional)",
-      initial: getEnvValue("CODEX_PATH") ?? "codex"
+      initial: "codex"
     },
     {
       type: "text",
       name: "codexModel",
       message: "Codex default model (optional)",
-      initial: getEnvValue("CODEX_MODEL") ?? "gpt-5"
+      initial: "gpt-5"
     },
     {
       type: "text",
       name: "openrouterApiKey",
       message: "OpenRouter API key (optional)",
-      initial: getEnvValue("OPENROUTER_API_KEY") ?? ""
+      initial: ""
     },
     {
       type: "text",
       name: "openrouterModel",
       message: "OpenRouter default model (optional)",
-      initial: getEnvValue("OPENROUTER_MODEL") ?? "openai/gpt-5"
+      initial: "openai/gpt-5"
     },
     {
       type: "text",
       name: "openrouterSiteUrl",
       message: "OpenRouter site URL (optional)",
-      initial: getEnvValue("OPENROUTER_SITE_URL") ?? ""
+      initial: ""
     },
     {
       type: "text",
       name: "openrouterAppName",
       message: "OpenRouter app name (optional)",
-      initial: getEnvValue("OPENROUTER_APP_NAME") ?? ""
+      initial: ""
     },
     {
       type: "text",
@@ -279,27 +279,6 @@ function buildEnvContent(config: {
   }
   if (config.githubAppKeyPath) {
     lines.push(`GITHUB_APP_KEY_PATH=${config.githubAppKeyPath}`);
-  }
-  if (config.codexPath) {
-    lines.push(`CODEX_PATH=${config.codexPath}`);
-  }
-  if (config.codexModel) {
-    lines.push(`CODEX_MODEL=${config.codexModel}`);
-  }
-  if (config.openrouterApiKey) {
-    lines.push(`OPENROUTER_API_KEY=${config.openrouterApiKey}`);
-  }
-  if (config.openrouterBaseUrl) {
-    lines.push(`OPENROUTER_BASE_URL=${config.openrouterBaseUrl}`);
-  }
-  if (config.openrouterModel) {
-    lines.push(`OPENROUTER_MODEL=${config.openrouterModel}`);
-  }
-  if (config.openrouterSiteUrl) {
-    lines.push(`OPENROUTER_SITE_URL=${config.openrouterSiteUrl}`);
-  }
-  if (config.openrouterAppName) {
-    lines.push(`OPENROUTER_APP_NAME=${config.openrouterAppName}`);
   }
   return lines.join("\n");
 }

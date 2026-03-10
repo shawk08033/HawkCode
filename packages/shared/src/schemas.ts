@@ -45,6 +45,10 @@ export const agentReplyRequestSchema = z.object({
   systemPrompt: z.string().min(1).optional()
 });
 
+export const agentCommitReplyRequestSchema = agentReplyRequestSchema.extend({
+  assistantContent: z.string().min(1)
+});
+
 export const agentReplyResponseSchema = z.object({
   sessionId: z.string().min(1),
   agentRunId: z.string().min(1),
@@ -61,4 +65,5 @@ export type AgentChatRole = z.infer<typeof agentChatRoleSchema>;
 export type AgentChatMessage = z.infer<typeof agentChatMessageSchema>;
 export type AgentProviderInfo = z.infer<typeof agentProviderInfoSchema>;
 export type AgentReplyRequest = z.infer<typeof agentReplyRequestSchema>;
+export type AgentCommitReplyRequest = z.infer<typeof agentCommitReplyRequestSchema>;
 export type AgentReplyResponse = z.infer<typeof agentReplyResponseSchema>;

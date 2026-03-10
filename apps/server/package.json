@@ -9,9 +9,9 @@
     "lint": "echo 'no lint yet'",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "setup": "tsx src/cli/setup.ts",
-    "prisma": "prisma",
-    "db:push:sqlite": "prisma db push --schema prisma/schema.sqlite.prisma",
-    "db:generate:sqlite": "prisma generate --schema prisma/schema.sqlite.prisma"
+    "prisma": "node scripts/prisma.mjs",
+    "db:push:sqlite": "node scripts/prisma.mjs db push --schema prisma/schema.sqlite.prisma",
+    "db:generate:sqlite": "node scripts/prisma.mjs generate --schema prisma/schema.sqlite.prisma"
   },
   "dependencies": {
     "@hawkcode/agent": "workspace:*",

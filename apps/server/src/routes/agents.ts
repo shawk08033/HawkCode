@@ -7,6 +7,7 @@ import {
 } from "@hawkcode/agent";
 import {
   agentProviderInfoSchema,
+  agentCommitReplyRequestSchema,
   agentReplyRequestSchema,
   agentReplyResponseSchema,
   type AgentChatMessage,
@@ -16,28 +17,29 @@ import { prisma } from "../lib/prisma.js";
 import { loadRuntimeConfig } from "../lib/runtime-config.js";
 import { getSessionUser } from "../lib/auth-session.js";
 
+function normalizeOptional(value?: string | null) {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
 async function buildProviderRegistry(): Promise<AgentProviderRegistry> {
   const runtimeConfig = loadRuntimeConfig();
-  const getValue = (configValue: string | undefined, envName: string) =>
-    configValue ?? process.env[envName];
-
-  const codexCommand = getValue(runtimeConfig?.codexPath, "CODEX_PATH") ?? "codex";
+  const codexCommand = normalizeOptional(runtimeConfig?.codexPath) ?? "codex";
   const codex = await canUseCodex(codexCommand)
     ? {
         command: codexCommand,
-        defaultModel: getValue(runtimeConfig?.codexModel, "CODEX_MODEL") ?? "gpt-5"
+        defaultModel: normalizeOptional(runtimeConfig?.codexModel) ?? "gpt-5"
       }
     : undefined;
 
-  const openrouterApiKey = getValue(runtimeConfig?.openrouterApiKey, "OPENROUTER_API_KEY");
+  const openrouterApiKey = runtimeConfig?.openrouterApiKey;
   const openrouter = openrouterApiKey
     ? {
         apiKey: openrouterApiKey,
-        baseUrl: getValue(runtimeConfig?.openrouterBaseUrl, "OPENROUTER_BASE_URL"),
-        defaultModel:
-          getValue(runtimeConfig?.openrouterModel, "OPENROUTER_MODEL") ?? "openai/gpt-5",
-        siteUrl: getValue(runtimeConfig?.openrouterSiteUrl, "OPENROUTER_SITE_URL"),
-        appName: getValue(runtimeConfig?.openrouterAppName, "OPENROUTER_APP_NAME") ?? "HawkCode"
+        baseUrl: runtimeConfig?.openrouterBaseUrl,
+        defaultModel: runtimeConfig?.openrouterModel ?? "openai/gpt-5",
+        siteUrl: runtimeConfig?.openrouterSiteUrl,
+        appName: runtimeConfig?.openrouterAppName ?? "HawkCode"
       }
     : undefined;
 
@@ -153,6 +155,86 @@ async function createToolCall(options: {
   });
 }
 
+async function persistAgentReply(options: {
+  provider: "codex" | "openrouter";
+  model: string;
+  sessionId?: string;
+  message: string;
+  assistantContent: string;
+  systemPrompt?: string;
+  userId: string;
+  memberships: Array<{ workspaceId: string }>;
+}) {
+  const primaryMembership = options.memberships[0];
+  if (!primaryMembership) {
+    throw new Error("no_workspace");
+  }
+
+  const workspaceIds = getMembershipWorkspaceIds(options.memberships);
+  const session = await resolveSession({
+    sessionId: options.sessionId,
+    userId: options.userId,
+    workspaceIds,
+    fallbackWorkspaceId: primaryMembership.workspaceId,
+    initialMessage: options.message
+  });
+
+  const userMessage = await prisma.message.create({
+    data: {
+      sessionId: session.id,
+      authorId: options.userId,
+      role: "user",
+      content: options.message
+    }
+  });
+
+  const agentRun = await prisma.agentRun.create({
+    data: {
+      sessionId: session.id,
+      status: "running"
+    }
+  });
+
+  const assistantMessage = await prisma.message.create({
+    data: {
+      sessionId: session.id,
+      authorId: options.userId,
+      role: "assistant",
+      content: options.assistantContent
+    }
+  });
+
+  await prisma.agentRun.update({
+    where: { id: agentRun.id },
+    data: { status: "succeeded" }
+  });
+
+  await createToolCall({
+    agentRunId: agentRun.id,
+    input: JSON.stringify({
+      provider: options.provider,
+      model: options.model,
+      sessionId: session.id,
+      prompt: userMessage.content,
+      systemPrompt: options.systemPrompt
+    }),
+    output: options.assistantContent
+  });
+
+  return agentReplyResponseSchema.parse({
+    sessionId: session.id,
+    agentRunId: agentRun.id,
+    provider: options.provider,
+    model: options.model,
+    message: {
+      id: assistantMessage.id,
+      role: "assistant",
+      content: assistantMessage.content,
+      createdAt: assistantMessage.createdAt.toISOString()
+    }
+  });
+}
+
 export async function registerAgentRoutes(server: FastifyInstance) {
   server.get("/agent/providers", async (request, reply) => {
     const user = await getSessionUser(request.cookies.hawkcode_session);
@@ -202,24 +284,11 @@ export async function registerAgentRoutes(server: FastifyInstance) {
         fallbackWorkspaceId: primaryMembership.workspaceId,
         initialMessage: parsed.data.message
       });
-
-      const userMessage = await prisma.message.create({
-        data: {
-          sessionId: session.id,
-          authorId: user.id,
-          role: "user",
-          content: parsed.data.message
-        }
-      });
-
-      const agentRun = await prisma.agentRun.create({
-        data: {
-          sessionId: session.id,
-          status: "running"
-        }
-      });
-
       const inputMessages = await getConversationMessages(session.id, parsed.data.systemPrompt);
+      inputMessages.push({
+        role: "user",
+        content: parsed.data.message
+      });
       const startedAt = Date.now();
       const result = await generateAgentReply({
         provider: parsed.data.provider,
@@ -228,47 +297,28 @@ export async function registerAgentRoutes(server: FastifyInstance) {
         registry
       });
       const durationMs = Date.now() - startedAt;
+      const persisted = await persistAgentReply({
+        provider: result.provider,
+        model: result.model,
+        sessionId: session.id,
+        message: parsed.data.message,
+        assistantContent: result.content,
+        systemPrompt: parsed.data.systemPrompt,
+        userId: user.id,
+        memberships: user.memberships
+      });
 
-      const assistantMessage = await prisma.message.create({
+      await prisma.toolCall.updateMany({
+        where: {
+          agentRunId: persisted.agentRunId,
+          name: "generate_reply"
+        },
         data: {
-          sessionId: session.id,
-          authorId: user.id,
-          role: "assistant",
-          content: result.content
+          durationMs
         }
       });
 
-      await prisma.agentRun.update({
-        where: { id: agentRun.id },
-        data: { status: "succeeded" }
-      });
-
-      await createToolCall({
-        agentRunId: agentRun.id,
-        input: JSON.stringify({
-          provider: parsed.data.provider,
-          model: parsed.data.model ?? configuredProvider.defaultModel,
-          sessionId: session.id,
-          prompt: userMessage.content
-        }),
-        output: result.content,
-        durationMs
-      });
-
-      return reply.send(
-        agentReplyResponseSchema.parse({
-          sessionId: session.id,
-          agentRunId: agentRun.id,
-          provider: result.provider,
-          model: result.model,
-          message: {
-            id: assistantMessage.id,
-            role: "assistant",
-            content: assistantMessage.content,
-            createdAt: assistantMessage.createdAt.toISOString()
-          }
-        })
-      );
+      return reply.send(persisted);
     } catch (error) {
       if (error instanceof Error && error.message === "session_not_found") {
         return reply.code(404).send({ error: "session_not_found" });
@@ -278,6 +328,48 @@ export async function registerAgentRoutes(server: FastifyInstance) {
       return reply.code(502).send({
         error: "agent_request_failed",
         message: error instanceof Error ? error.message : "unknown_error"
+      });
+    }
+  });
+
+  server.post("/agent/reply/commit", async (request, reply) => {
+    const user = await getSessionUser(request.cookies.hawkcode_session);
+    if (!user) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+
+    const parsed = agentCommitReplyRequestSchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({
+        error: "invalid_request",
+        details: parsed.error.flatten()
+      });
+    }
+
+    try {
+      const result = await persistAgentReply({
+        provider: parsed.data.provider,
+        model: parsed.data.model ?? "gpt-5",
+        sessionId: parsed.data.sessionId,
+        message: parsed.data.message,
+        assistantContent: parsed.data.assistantContent,
+        systemPrompt: parsed.data.systemPrompt,
+        userId: user.id,
+        memberships: user.memberships
+      });
+
+      return reply.send(result);
+    } catch (error) {
+      if (error instanceof Error && error.message === "session_not_found") {
+        return reply.code(404).send({ error: "session_not_found" });
+      }
+      if (error instanceof Error && error.message === "no_workspace") {
+        return reply.code(403).send({ error: "no_workspace" });
+      }
+
+      request.log.error(error);
+      return reply.code(500).send({
+        error: "agent_commit_failed"
       });
     }
   });
