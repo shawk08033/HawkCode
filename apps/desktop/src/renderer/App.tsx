@@ -56,9 +56,22 @@ type AgentReplyResponse = {
   };
 };
 
+type CodexAuthStatus = {
+  loggedIn: boolean;
+  inProgress: boolean;
+  authUrl?: string;
+  code?: string;
+  statusText?: string;
+  error?: string;
+};
+
 type WorkspaceTreeResponse = {
   workspaces?: WorkspaceRecord[];
 };
+
+type MessageSegment =
+  | { type: "text"; content: string }
+  | { type: "code"; content: string; language?: string };
 
 const IS_DEV = !window.hawkcode?.version ? false : true;
 const DEFAULT_URL = IS_DEV ? "http://localhost:3001" : "https://localhost:3001";
@@ -178,6 +191,288 @@ function preferProvider(providers: ProviderInfo[]) {
   return providers.find((provider) => provider.name === "codex") ?? providers[0] ?? null;
 }
 
+function mergeProviders(serverProviders: ProviderInfo[], codexAuth: CodexAuthStatus) {
+  if (!codexAuth.loggedIn) {
+    return serverProviders;
+  }
+
+  const hasCodex = serverProviders.some((provider) => provider.name === "codex");
+  if (hasCodex) {
+    return serverProviders;
+  }
+
+  return [
+    {
+      name: "codex",
+      label: "Codex",
+      defaultModel: "gpt-5"
+    } satisfies ProviderInfo,
+    ...serverProviders
+  ];
+}
+
+function getModelOptions(provider?: ProviderInfo | null) {
+  if (!provider) {
+    return [];
+  }
+
+  if (provider.name === "codex") {
+    return ["gpt-5", "gpt-5-codex", "gpt-5-mini"];
+  }
+
+  return [
+    provider.defaultModel,
+    "openai/gpt-5",
+    "openai/gpt-5-mini",
+    "anthropic/claude-sonnet-4",
+    "google/gemini-2.5-pro"
+  ].filter((value, index, all) => all.indexOf(value) === index);
+}
+
+function parseMessageContent(content: string): MessageSegment[] {
+  const matches = [...content.matchAll(/```([\w.+-]*)\n?([\s\S]*?)```/g)];
+  if (matches.length === 0) {
+    return [{ type: "text", content }];
+  }
+
+  const segments: MessageSegment[] = [];
+  let cursor = 0;
+
+  for (const match of matches) {
+    const start = match.index ?? 0;
+    if (start > cursor) {
+      segments.push({
+        type: "text",
+        content: content.slice(cursor, start)
+      });
+    }
+
+    segments.push({
+      type: "code",
+      language: match[1] || undefined,
+      content: match[2].replace(/\n$/, "")
+    });
+    cursor = start + match[0].length;
+  }
+
+  if (cursor < content.length) {
+    segments.push({
+      type: "text",
+      content: content.slice(cursor)
+    });
+  }
+
+  return segments.filter((segment) => segment.content.length > 0);
+}
+
+function renderInlineContent(content: string, keyPrefix: string) {
+  const pattern = /(`[^`]+`)|(\[([^\]]+)\]\((https?:\/\/[^)\s]+)\))|(https?:\/\/\S+)/g;
+  const nodes: Array<string | JSX.Element> = [];
+  let lastIndex = 0;
+  let match: RegExpExecArray | null;
+  let tokenIndex = 0;
+
+  while ((match = pattern.exec(content)) !== null) {
+    if (match.index > lastIndex) {
+      nodes.push(content.slice(lastIndex, match.index));
+    }
+
+    if (match[1]) {
+      nodes.push(
+        <code
+          key={`${keyPrefix}-code-${tokenIndex}`}
+          className="rounded bg-black/10 px-1.5 py-0.5 font-mono text-[0.9em]"
+        >
+          {match[1].slice(1, -1)}
+        </code>
+      );
+    } else {
+      const label = match[3] ?? match[0];
+      const url = match[4] ?? match[5];
+      nodes.push(
+        <button
+          key={`${keyPrefix}-link-${tokenIndex}`}
+          type="button"
+          className="text-left text-primary underline underline-offset-4"
+          onClick={() => void window.hawkcode.openExternalUrl(url)}
+        >
+          {label}
+        </button>
+      );
+    }
+
+    lastIndex = pattern.lastIndex;
+    tokenIndex += 1;
+  }
+
+  if (lastIndex < content.length) {
+    nodes.push(content.slice(lastIndex));
+  }
+
+  return nodes;
+}
+
+function renderTextSegment(content: string, keyPrefix: string) {
+  const lines = content.split("\n");
+  const blocks: JSX.Element[] = [];
+  let index = 0;
+  let blockIndex = 0;
+
+  while (index < lines.length) {
+    const line = lines[index];
+    const trimmed = line.trim();
+
+    if (!trimmed) {
+      index += 1;
+      continue;
+    }
+
+    const heading = trimmed.match(/^(#{1,3})\s+(.+)$/);
+    if (heading) {
+      const level = heading[1].length;
+      const title = heading[2];
+      const className =
+        level === 1
+          ? "text-lg font-semibold"
+          : level === 2
+            ? "text-base font-semibold"
+            : "text-sm font-semibold uppercase tracking-[0.12em]";
+      blocks.push(
+        <div key={`${keyPrefix}-heading-${blockIndex}`} className={className}>
+          {renderInlineContent(title, `${keyPrefix}-heading-inline-${blockIndex}`)}
+        </div>
+      );
+      index += 1;
+      blockIndex += 1;
+      continue;
+    }
+
+    if (/^>\s?/.test(trimmed)) {
+      const quoteLines: string[] = [];
+      while (index < lines.length && /^>\s?/.test(lines[index].trim())) {
+        quoteLines.push(lines[index].trim().replace(/^>\s?/, ""));
+        index += 1;
+      }
+      blocks.push(
+        <blockquote
+          key={`${keyPrefix}-quote-${blockIndex}`}
+          className="border-l-2 border-border pl-4 text-muted-foreground"
+        >
+          {quoteLines.map((quoteLine, quoteIndex) => (
+            <p key={`${keyPrefix}-quote-line-${quoteIndex}`} className="whitespace-pre-wrap text-sm leading-6">
+              {renderInlineContent(quoteLine, `${keyPrefix}-quote-inline-${quoteIndex}`)}
+            </p>
+          ))}
+        </blockquote>
+      );
+      blockIndex += 1;
+      continue;
+    }
+
+    if (/^[-*]\s+/.test(trimmed)) {
+      const items: string[] = [];
+      while (index < lines.length && /^[-*]\s+/.test(lines[index].trim())) {
+        items.push(lines[index].trim().replace(/^[-*]\s+/, ""));
+        index += 1;
+      }
+      blocks.push(
+        <ul key={`${keyPrefix}-ul-${blockIndex}`} className="list-disc space-y-1 pl-5 text-sm leading-6">
+          {items.map((item, itemIndex) => (
+            <li key={`${keyPrefix}-ul-item-${itemIndex}`}>
+              {renderInlineContent(item, `${keyPrefix}-ul-inline-${itemIndex}`)}
+            </li>
+          ))}
+        </ul>
+      );
+      blockIndex += 1;
+      continue;
+    }
+
+    if (/^\d+\.\s+/.test(trimmed)) {
+      const items: string[] = [];
+      while (index < lines.length && /^\d+\.\s+/.test(lines[index].trim())) {
+        items.push(lines[index].trim().replace(/^\d+\.\s+/, ""));
+        index += 1;
+      }
+      blocks.push(
+        <ol key={`${keyPrefix}-ol-${blockIndex}`} className="list-decimal space-y-1 pl-5 text-sm leading-6">
+          {items.map((item, itemIndex) => (
+            <li key={`${keyPrefix}-ol-item-${itemIndex}`}>
+              {renderInlineContent(item, `${keyPrefix}-ol-inline-${itemIndex}`)}
+            </li>
+          ))}
+        </ol>
+      );
+      blockIndex += 1;
+      continue;
+    }
+
+    const paragraphLines: string[] = [];
+    while (index < lines.length && lines[index].trim()) {
+      if (
+        /^(#{1,3})\s+/.test(lines[index].trim()) ||
+        /^>\s?/.test(lines[index].trim()) ||
+        /^[-*]\s+/.test(lines[index].trim()) ||
+        /^\d+\.\s+/.test(lines[index].trim())
+      ) {
+        break;
+      }
+      paragraphLines.push(lines[index]);
+      index += 1;
+    }
+    const paragraph = paragraphLines.join("\n");
+    blocks.push(
+      <p key={`${keyPrefix}-p-${blockIndex}`} className="whitespace-pre-wrap text-sm leading-6">
+        {renderInlineContent(paragraph, `${keyPrefix}-p-inline-${blockIndex}`)}
+      </p>
+    );
+    blockIndex += 1;
+  }
+
+  return blocks;
+}
+
+function renderMessageContent(
+  content: string,
+  messageId: string,
+  copiedCodeId: string | null,
+  onCopyCode: (codeId: string, code: string) => void
+) {
+  return parseMessageContent(content).map((segment, index) => {
+    if (segment.type === "code") {
+      const codeId = `${messageId}-code-${index}`;
+      return (
+        <div
+          key={codeId}
+          className="my-3 overflow-hidden rounded-2xl border border-border/70 bg-black/90 text-white"
+        >
+          <div className="flex items-center justify-between border-b border-white/10 px-4 py-2">
+            <div className="text-[10px] uppercase tracking-[0.2em] text-white/60">
+              {segment.language ?? "Code"}
+            </div>
+            <button
+              type="button"
+              className="text-[10px] uppercase tracking-[0.2em] text-white/70 transition-colors hover:text-white"
+              onClick={() => onCopyCode(codeId, segment.content)}
+            >
+              {copiedCodeId === codeId ? "Copied" : "Copy"}
+            </button>
+          </div>
+          <pre className="overflow-x-auto px-4 py-3 text-xs leading-6">
+            <code>{segment.content}</code>
+          </pre>
+        </div>
+      );
+    }
+
+    return (
+      <div key={`${messageId}-text-${index}`} className="space-y-3">
+        {renderTextSegment(segment.content, `${messageId}-text-segment-${index}`)}
+      </div>
+    );
+  });
+}
+
 export default function App() {
   const [serverUrl, setServerUrl] = useState(DEFAULT_URL);
   const [status, setStatus] = useState<Status>({ state: "idle" });
@@ -192,10 +487,16 @@ export default function App() {
     "ws-2": false
   });
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
-  const [providers, setProviders] = useState<ProviderInfo[]>([]);
   const [selectedProvider, setSelectedProvider] = useState<"codex" | "openrouter" | null>(null);
+  const [selectedModel, setSelectedModel] = useState("");
   const [isSending, setIsSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
+  const [copiedCodeId, setCopiedCodeId] = useState<string | null>(null);
+  const [serverProviders, setServerProviders] = useState<ProviderInfo[]>([]);
+  const [codexAuth, setCodexAuth] = useState<CodexAuthStatus>({
+    loggedIn: false,
+    inProgress: false
+  });
 
   const allSessions = useMemo(
     () => workspaceTree.flatMap((workspace) => workspace.sessions),
@@ -212,9 +513,14 @@ export default function App() {
       ) ?? workspaceTree[0],
     [selectedSessionId, workspaceTree]
   );
+  const availableProviders = useMemo(
+    () => mergeProviders(serverProviders, codexAuth),
+    [serverProviders, codexAuth]
+  );
   const activeProvider =
-    providers.find((provider) => provider.name === selectedProvider) ??
-    preferProvider(providers);
+    availableProviders.find((provider) => provider.name === selectedProvider) ??
+    preferProvider(availableProviders);
+  const availableModels = useMemo(() => getModelOptions(activeProvider), [activeProvider]);
 
   useEffect(() => {
     window.hawkcode.getServerConfig().then((config) => {
@@ -237,6 +543,30 @@ export default function App() {
     setDraft("");
     setSendError(null);
   }, [selectedSessionId]);
+
+  useEffect(() => {
+    if (availableProviders.length === 0) {
+      if (selectedProvider !== null) {
+        setSelectedProvider(null);
+      }
+      return;
+    }
+
+    if (!selectedProvider || !availableProviders.some((provider) => provider.name === selectedProvider)) {
+      setSelectedProvider(preferProvider(availableProviders)?.name ?? null);
+    }
+  }, [availableProviders, selectedProvider]);
+
+  useEffect(() => {
+    if (!activeProvider) {
+      setSelectedModel("");
+      return;
+    }
+
+    setSelectedModel((current) =>
+      current && availableModels.includes(current) ? current : activeProvider.defaultModel
+    );
+  }, [activeProvider, availableModels]);
 
   useEffect(() => {
     async function checkAuth() {
@@ -263,7 +593,7 @@ export default function App() {
 
   useEffect(() => {
     if (!authUser) {
-      setProviders([]);
+      setServerProviders([]);
       setSelectedProvider(null);
       return;
     }
@@ -275,27 +605,66 @@ export default function App() {
           credentials: "include"
         });
         if (!response.ok) {
-          setProviders([]);
+          setServerProviders([]);
           setSelectedProvider(null);
           return;
         }
         const data = (await response.json()) as { providers?: ProviderInfo[] };
         const nextProviders = data.providers ?? [];
-        setProviders(nextProviders);
+        setServerProviders(nextProviders);
         setSelectedProvider((current) => {
-          if (current && nextProviders.some((provider) => provider.name === current)) {
+          const merged = mergeProviders(nextProviders, codexAuth);
+          if (current && merged.some((provider) => provider.name === current)) {
             return current;
           }
-          return preferProvider(nextProviders)?.name ?? null;
+          return preferProvider(merged)?.name ?? null;
         });
       } catch {
-        setProviders([]);
+        setServerProviders([]);
         setSelectedProvider(null);
       }
     }
 
     void loadProviders();
+  }, [authUser, serverUrl, codexAuth.loggedIn]);
+
+  useEffect(() => {
+    if (!authUser) {
+      setCodexAuth({
+        loggedIn: false,
+        inProgress: false
+      });
+      return;
+    }
+
+    async function loadCodexAuthStatus() {
+      try {
+        setCodexAuth(await window.hawkcode.getCodexAuthStatus());
+      } catch {
+        setCodexAuth({
+          loggedIn: false,
+          inProgress: false,
+          error: "Could not check Codex login state."
+        });
+      }
+    }
+
+    void loadCodexAuthStatus();
   }, [authUser, serverUrl]);
+
+  useEffect(() => {
+    if (!codexAuth.inProgress) {
+      return;
+    }
+
+    const interval = window.setInterval(() => {
+      void window.hawkcode.getCodexAuthStatus().then(setCodexAuth).catch(() => undefined);
+    }, 2000);
+
+    return () => {
+      window.clearInterval(interval);
+    };
+  }, [codexAuth.inProgress]);
 
   useEffect(() => {
     if (!authUser) {
@@ -478,24 +847,126 @@ export default function App() {
     );
   }
 
+  function appendOptimisticUserMessage(localSessionId: string, prompt: string) {
+    const optimisticId = `optimistic-user-${Date.now()}`;
+
+    setWorkspaceTree((current) =>
+      current.map((workspace) => ({
+        ...workspace,
+        sessions: workspace.sessions.map((session) => {
+          if (session.id !== localSessionId) {
+            return session;
+          }
+
+          return {
+            ...session,
+            updated: "Just now",
+            messages: [
+              ...session.messages,
+              {
+                id: optimisticId,
+                role: "user",
+                content: prompt,
+                timestamp: formatTimestamp()
+              }
+            ]
+          };
+        })
+      }))
+    );
+
+    return optimisticId;
+  }
+
+  function removeOptimisticMessage(localSessionId: string, optimisticId: string) {
+    setWorkspaceTree((current) =>
+      current.map((workspace) => ({
+        ...workspace,
+        sessions: workspace.sessions.map((session) => {
+          if (session.id !== localSessionId) {
+            return session;
+          }
+
+          return {
+            ...session,
+            messages: session.messages.filter((message) => message.id !== optimisticId)
+          };
+        })
+      }))
+    );
+  }
+
+  function handleCopyCode(codeId: string, code: string) {
+    void navigator.clipboard.writeText(code).then(() => {
+      setCopiedCodeId(codeId);
+      window.setTimeout(() => {
+        setCopiedCodeId((current) => (current === codeId ? null : current));
+      }, 1500);
+    });
+  }
+
   async function handleSend() {
     if (!selectedSession || !draft.trim() || !activeProvider) {
       return;
     }
 
+    const prompt = draft.trim();
+    const optimisticId = appendOptimisticUserMessage(selectedSession.id, prompt);
     setIsSending(true);
     setSendError(null);
+    setDraft("");
 
     try {
+      if (activeProvider.name === "codex") {
+        const localResult = await window.hawkcode.generateCodexReply({
+          model: selectedModel || activeProvider.defaultModel,
+          messages: [
+            ...selectedSession.messages.map((message) => ({
+              role: message.role,
+              content: message.content
+            })),
+            {
+              role: "user",
+              content: prompt
+            }
+          ]
+        });
+
+        const commitResponse = await fetch(`${serverUrl.replace(/\/$/, "")}/agent/reply/commit`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({
+            provider: localResult.provider,
+            model: localResult.model,
+            sessionId: selectedSession.serverSessionId,
+            message: prompt,
+            assistantContent: localResult.content
+          })
+        });
+
+        if (!commitResponse.ok) {
+          const errorBody = (await commitResponse.json().catch(() => null)) as
+            | { message?: string; error?: string }
+            | null;
+          throw new Error(errorBody?.message ?? errorBody?.error ?? "Agent request failed.");
+        }
+
+        const committed = (await commitResponse.json()) as AgentReplyResponse;
+        removeOptimisticMessage(selectedSession.id, optimisticId);
+        applyReplyToSession(selectedSession.id, prompt, committed);
+        return;
+      }
+
       const response = await fetch(`${serverUrl.replace(/\/$/, "")}/agent/reply`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         credentials: "include",
         body: JSON.stringify({
           provider: activeProvider.name,
-          model: activeProvider.defaultModel,
+          model: selectedModel || activeProvider.defaultModel,
           sessionId: selectedSession.serverSessionId,
-          message: draft.trim()
+          message: prompt
         })
       });
 
@@ -507,12 +978,27 @@ export default function App() {
       }
 
       const result = (await response.json()) as AgentReplyResponse;
-      applyReplyToSession(selectedSession.id, draft.trim(), result);
-      setDraft("");
+      removeOptimisticMessage(selectedSession.id, optimisticId);
+      applyReplyToSession(selectedSession.id, prompt, result);
     } catch (error) {
+      removeOptimisticMessage(selectedSession.id, optimisticId);
+      setDraft(prompt);
       setSendError(error instanceof Error ? error.message : "Agent request failed.");
     } finally {
       setIsSending(false);
+    }
+  }
+
+  async function handleConnectCodex() {
+    try {
+      const nextStatus = await window.hawkcode.startCodexAuth();
+      setCodexAuth(nextStatus);
+    } catch (error) {
+      setCodexAuth({
+        loggedIn: false,
+        inProgress: false,
+        error: error instanceof Error ? error.message : "Could not start Codex login."
+      });
     }
   }
 
@@ -739,7 +1225,14 @@ export default function App() {
                         <span>{message.role === "user" ? "You" : "Assistant"}</span>
                         <span>{message.timestamp}</span>
                       </div>
-                      <p className="whitespace-pre-wrap text-sm leading-6">{message.content}</p>
+                      <div className="space-y-3">
+                        {renderMessageContent(
+                          message.content,
+                          message.id,
+                          copiedCodeId,
+                          handleCopyCode
+                        )}
+                      </div>
                     </div>
                   </div>
                 ))}
@@ -794,13 +1287,21 @@ export default function App() {
                 <textarea
                   value={draft}
                   onChange={(event) => setDraft(event.target.value)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" && !event.shiftKey) {
+                      event.preventDefault();
+                      if (selectedSession && draft.trim() && activeProvider && !isSending) {
+                        void handleSend();
+                      }
+                    }
+                  }}
                   placeholder="Message HawkCode about this session..."
                   className="min-h-28 w-full resize-none bg-transparent text-sm leading-6 text-foreground outline-none placeholder:text-muted-foreground"
                 />
                 <div className="mt-3 flex items-center justify-between gap-3">
                   <div className="text-xs text-muted-foreground">
-                    {providers.length > 0
-                      ? `Using ${activeProvider?.label ?? "agent"} for this reply.`
+                    {availableProviders.length > 0
+                      ? `Using ${activeProvider?.label ?? "agent"}${selectedModel ? ` · ${selectedModel}` : ""} for this reply.`
                       : "No agent providers available yet."}
                   </div>
                   <div className="flex items-center gap-2">
@@ -810,12 +1311,24 @@ export default function App() {
                         setSelectedProvider(event.target.value as "codex" | "openrouter")
                       }
                       className="h-9 rounded-md border border-border bg-background px-3 text-sm"
-                      disabled={providers.length === 0 || isSending}
+                      disabled={availableProviders.length === 0 || isSending}
                     >
-                      {providers.length === 0 ? <option value="">No providers</option> : null}
-                      {providers.map((provider) => (
+                      {availableProviders.length === 0 ? <option value="">No providers</option> : null}
+                      {availableProviders.map((provider) => (
                         <option key={provider.name} value={provider.name}>
                           {provider.label}
+                        </option>
+                      ))}
+                    </select>
+                    <select
+                      value={selectedModel}
+                      onChange={(event) => setSelectedModel(event.target.value)}
+                      className="h-9 w-44 rounded-md border border-border bg-background px-3 text-sm"
+                      disabled={!activeProvider || isSending}
+                    >
+                      {availableModels.map((model) => (
+                        <option key={model} value={model}>
+                          {model}
                         </option>
                       ))}
                     </select>
@@ -912,6 +1425,48 @@ export default function App() {
             </TabsContent>
             <TabsContent value="integrations">
               <div className="space-y-3">
+                <Card>
+                  <CardHeader>
+                    <CardTitle>Codex</CardTitle>
+                    <CardDescription>
+                      Connect this desktop client to your ChatGPT-backed Codex login.
+                    </CardDescription>
+                  </CardHeader>
+                  <CardContent className="space-y-3">
+                    <div className="rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground">
+                      Status: {codexAuth.loggedIn ? "Connected" : codexAuth.inProgress ? "Waiting for sign-in" : "Not connected"}
+                    </div>
+                    {codexAuth.statusText ? (
+                      <div className="rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground">
+                        {codexAuth.statusText}
+                      </div>
+                    ) : null}
+                    {codexAuth.code ? (
+                      <div className="rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground">
+                        Device code: {codexAuth.code}
+                      </div>
+                    ) : null}
+                    {codexAuth.authUrl ? (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => void window.hawkcode.openExternalUrl(codexAuth.authUrl!)}
+                      >
+                        Open auth URL
+                      </Button>
+                    ) : null}
+                    {codexAuth.error ? (
+                      <div className="text-xs text-destructive">{codexAuth.error}</div>
+                    ) : null}
+                    <Button
+                      size="sm"
+                      onClick={handleConnectCodex}
+                      disabled={codexAuth.inProgress}
+                    >
+                      {codexAuth.inProgress ? "Waiting for browser login..." : codexAuth.loggedIn ? "Reconnect Codex" : "Connect Codex"}
+                    </Button>
+                  </CardContent>
+                </Card>
                 <Card>
                   <CardHeader>
                     <CardTitle>GitHub</CardTitle>

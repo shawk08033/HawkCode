@@ -12,6 +12,26 @@ type HealthStatus = {
   checkedAt: string;
 };
 
+type CodexAuthStatus = {
+  loggedIn: boolean;
+  inProgress: boolean;
+  authUrl?: string;
+  code?: string;
+  statusText?: string;
+  error?: string;
+};
+
+type CodexGeneratePayload = {
+  messages: Array<{ role: string; content: string }>;
+  model?: string;
+};
+
+type CodexGenerateResult = {
+  provider: "codex";
+  model: string;
+  content: string;
+};
+
 declare global {
   interface Window {
     hawkcode: {
@@ -21,6 +41,10 @@ declare global {
       checkHealth: (url: string) => Promise<HealthStatus>;
       getPendingCert: (hostname: string) => Promise<PendingCert | null>;
       trustCert: (hostname: string) => Promise<{ ok: boolean }>;
+      getCodexAuthStatus: () => Promise<CodexAuthStatus>;
+      startCodexAuth: () => Promise<CodexAuthStatus>;
+      openExternalUrl: (url: string) => Promise<{ ok: boolean }>;
+      generateCodexReply: (payload: CodexGeneratePayload) => Promise<CodexGenerateResult>;
     };
   }
 }
