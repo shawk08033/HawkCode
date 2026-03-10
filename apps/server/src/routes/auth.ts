@@ -1,8 +1,10 @@
 import { FastifyInstance } from "fastify";
 import bcrypt from "bcryptjs";
 import crypto from "node:crypto";
-import { prisma } from "../lib/prisma";
-import { loadRuntimeConfig } from "../lib/runtime-config";
+import { Prisma } from "@prisma/client";
+import { prisma } from "../lib/prisma.js";
+import { loadRuntimeConfig } from "../lib/runtime-config.js";
+import { getSessionUser } from "../lib/auth-session.js";
 
 type LoginBody = {
   email: string;
@@ -43,20 +45,6 @@ function getExpiry() {
   const expires = new Date();
   expires.setDate(expires.getDate() + SESSION_TTL_DAYS);
   return expires;
-}
-
-async function getSessionUser(token?: string) {
-  if (!token) return null;
-  const session = await prisma.authSession.findUnique({
-    where: { token },
-    include: { user: { include: { memberships: true } } }
-  });
-  if (!session) return null;
-  if (session.expiresAt < new Date()) {
-    await prisma.authSession.delete({ where: { id: session.id } });
-    return null;
-  }
-  return session.user;
 }
 
 export async function registerAuthRoutes(server: FastifyInstance) {
@@ -129,7 +117,7 @@ export async function registerAuthRoutes(server: FastifyInstance) {
       const tokenValue = createToken();
       const expiresAt = getExpiry();
 
-      const result = await prisma.$transaction(async (tx) => {
+      const result = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
         const user = await tx.user.create({
           data: { email, passwordHash }
         });
@@ -214,7 +202,14 @@ export async function registerAuthRoutes(server: FastifyInstance) {
     });
 
     return reply.send({
-      invites: invites.map((invite) => ({
+      invites: invites.map((invite: {
+        id: string;
+        token: string;
+        role: string;
+        email: string | null;
+        expiresAt: Date;
+        acceptedAt: Date | null;
+      }) => ({
         id: invite.id,
         token: invite.token,
         role: invite.role,

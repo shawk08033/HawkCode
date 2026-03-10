@@ -12,6 +12,12 @@ type User = {
   email: string;
 };
 
+type ProviderInfo = {
+  name: "codex" | "openrouter";
+  label: string;
+  defaultModel: string;
+};
+
 type ChatMessage = {
   id: string;
   role: "user" | "assistant";
@@ -21,6 +27,7 @@ type ChatMessage = {
 
 type SessionRecord = {
   id: string;
+  serverSessionId?: string;
   title: string;
   updated: string;
   model: string;
@@ -37,127 +44,155 @@ type WorkspaceRecord = {
   schedules: Array<{ id: string; title: string }>;
 };
 
+type AgentReplyResponse = {
+  sessionId: string;
+  agentRunId: string;
+  provider: "codex" | "openrouter";
+  model: string;
+  message: {
+    id: string;
+    role: "assistant";
+    content: string;
+    createdAt: string;
+  };
+};
+
+type WorkspaceTreeResponse = {
+  workspaces?: WorkspaceRecord[];
+};
+
 const DEFAULT_URL = "http://localhost:3001";
+
+function formatTimestamp(value?: string) {
+  if (!value) {
+    return "Now";
+  }
+
+  const parsed = new Date(value);
+  if (Number.isNaN(parsed.getTime())) {
+    return "Now";
+  }
+
+  return parsed.toLocaleTimeString([], {
+    hour: "numeric",
+    minute: "2-digit"
+  });
+}
+
+function createInitialWorkspaces(): WorkspaceRecord[] {
+  return [
+    {
+      id: "ws-1",
+      name: "HawkCode",
+      sessions: [
+        {
+          id: "sess-1",
+          title: "Auth + invites",
+          updated: "2m ago",
+          model: "Codex",
+          branch: "feature/desktop-chat-ui",
+          status: "Live",
+          contextCount: 6,
+          messages: [
+            {
+              id: "m-1",
+              role: "user",
+              content:
+                "Review the invite acceptance flow and tell me where the workspace UI still feels rough.",
+              timestamp: "9:14 AM"
+            },
+            {
+              id: "m-2",
+              role: "assistant",
+              content:
+                "The biggest gap is that session state, context, and actions are split across views. Pulling them into a standard chat layout makes the workflow easier to understand.",
+              timestamp: "9:15 AM"
+            }
+          ]
+        },
+        {
+          id: "sess-2",
+          title: "Desktop onboarding",
+          updated: "40m ago",
+          model: "OpenRouter",
+          branch: "desktop-app-init",
+          status: "Waiting",
+          contextCount: 4,
+          messages: [
+            {
+              id: "m-5",
+              role: "user",
+              content: "Draft a cleaner first-run experience for connecting a workstation to HawkCode.",
+              timestamp: "8:36 AM"
+            },
+            {
+              id: "m-6",
+              role: "assistant",
+              content:
+                "Use a short connection stepper: server URL, trust decision, sign-in, then workspace selection. That keeps the flow understandable and reduces dead-end states.",
+              timestamp: "8:37 AM"
+            }
+          ]
+        }
+      ],
+      schedules: [
+        { id: "sch-1", title: "Nightly test run" },
+        { id: "sch-2", title: "Morning standup summary" }
+      ]
+    },
+    {
+      id: "ws-2",
+      name: "Internal Tools",
+      sessions: [
+        {
+          id: "sess-3",
+          title: "Cron runner",
+          updated: "1d ago",
+          model: "Codex",
+          branch: "main",
+          status: "Idle",
+          contextCount: 3,
+          messages: [
+            {
+              id: "m-7",
+              role: "user",
+              content: "Map out how scheduled prompts should surface run history and failures.",
+              timestamp: "Yesterday"
+            },
+            {
+              id: "m-8",
+              role: "assistant",
+              content:
+                "Show the last run status directly in the workspace tree, then keep full logs and retry actions in a side panel so the main view stays focused on the conversation.",
+              timestamp: "Yesterday"
+            }
+          ]
+        }
+      ],
+      schedules: [{ id: "sch-3", title: "Dependency audit" }]
+    }
+  ];
+}
+
+function preferProvider(providers: ProviderInfo[]) {
+  return providers.find((provider) => provider.name === "codex") ?? providers[0] ?? null;
+}
 
 export default function AppHome() {
   const [serverUrl, setServerUrl] = useState(DEFAULT_URL);
   const [user, setUser] = useState<User | null>(null);
   const [isAdmin, setIsAdmin] = useState(false);
   const [draft, setDraft] = useState("");
+  const [workspaceTree, setWorkspaceTree] = useState<WorkspaceRecord[]>(createInitialWorkspaces);
   const [expanded, setExpanded] = useState<Record<string, boolean>>({
     "ws-1": true,
     "ws-2": false
   });
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
-
-  const workspaceTree = useMemo<WorkspaceRecord[]>(
-    () => [
-      {
-        id: "ws-1",
-        name: "HawkCode",
-        sessions: [
-          {
-            id: "sess-1",
-            title: "Auth + invites",
-            updated: "2m ago",
-            model: "GPT-5",
-            branch: "feature/desktop-chat-ui",
-            status: "Live",
-            contextCount: 6,
-            messages: [
-              {
-                id: "m-1",
-                role: "user",
-                content:
-                  "Review the invite acceptance flow and tell me where the workspace UI still feels rough.",
-                timestamp: "9:14 AM"
-              },
-              {
-                id: "m-2",
-                role: "assistant",
-                content:
-                  "The biggest gap is that session state, context, and actions are split across views. Pulling them into a standard chat layout makes the workflow easier to understand.",
-                timestamp: "9:15 AM"
-              },
-              {
-                id: "m-3",
-                role: "user",
-                content: "Make the web app match that chat-first model too.",
-                timestamp: "9:17 AM"
-              },
-              {
-                id: "m-4",
-                role: "assistant",
-                content:
-                  "I would keep the workspace tree on the left, move the conversation into the center, and use the right rail for context, activity, and tools.",
-                timestamp: "9:18 AM"
-              }
-            ]
-          },
-          {
-            id: "sess-2",
-            title: "Desktop onboarding",
-            updated: "40m ago",
-            model: "GPT-5",
-            branch: "desktop-app-init",
-            status: "Waiting",
-            contextCount: 4,
-            messages: [
-              {
-                id: "m-5",
-                role: "user",
-                content: "Draft a cleaner first-run experience for connecting a workstation to HawkCode.",
-                timestamp: "8:36 AM"
-              },
-              {
-                id: "m-6",
-                role: "assistant",
-                content:
-                  "Use a short connection stepper: server URL, trust decision, sign-in, then workspace selection. That keeps the flow understandable and reduces dead-end states.",
-                timestamp: "8:37 AM"
-              }
-            ]
-          }
-        ],
-        schedules: [
-          { id: "sch-1", title: "Nightly test run" },
-          { id: "sch-2", title: "Morning standup summary" }
-        ]
-      },
-      {
-        id: "ws-2",
-        name: "Internal Tools",
-        sessions: [
-          {
-            id: "sess-3",
-            title: "Cron runner",
-            updated: "1d ago",
-            model: "GPT-5 mini",
-            branch: "main",
-            status: "Idle",
-            contextCount: 3,
-            messages: [
-              {
-                id: "m-7",
-                role: "user",
-                content: "Map out how scheduled prompts should surface run history and failures.",
-                timestamp: "Yesterday"
-              },
-              {
-                id: "m-8",
-                role: "assistant",
-                content:
-                  "Show the last run status directly in the workspace tree, then keep full logs and retry actions in a side panel so the main view stays focused on the conversation.",
-                timestamp: "Yesterday"
-              }
-            ]
-          }
-        ],
-        schedules: [{ id: "sch-3", title: "Dependency audit" }]
-      }
-    ],
-    []
-  );
+  const [providers, setProviders] = useState<ProviderInfo[]>([]);
+  const [selectedProvider, setSelectedProvider] = useState<"codex" | "openrouter" | null>(null);
+  const [isSending, setIsSending] = useState(false);
+  const [sendError, setSendError] = useState<string | null>(null);
 
   const allSessions = useMemo(
     () => workspaceTree.flatMap((workspace) => workspace.sessions),
@@ -174,6 +209,9 @@ export default function AppHome() {
       ) ?? workspaceTree[0],
     [selectedSessionId, workspaceTree]
   );
+  const activeProvider =
+    providers.find((provider) => provider.name === selectedProvider) ??
+    preferProvider(providers);
 
   useEffect(() => {
     const saved = window.localStorage.getItem("hawkcode.serverUrl");
@@ -206,10 +244,14 @@ export default function AppHome() {
     if (!selectedSessionId && allSessions.length > 0) {
       setSelectedSessionId(allSessions[0].id);
     }
+    if (selectedSessionId && !allSessions.some((session) => session.id === selectedSessionId)) {
+      setSelectedSessionId(allSessions[0]?.id ?? null);
+    }
   }, [selectedSessionId, allSessions]);
 
   useEffect(() => {
     setDraft("");
+    setSendError(null);
   }, [selectedSessionId]);
 
   useEffect(() => {
@@ -247,6 +289,76 @@ export default function AppHome() {
     void fetchMe();
   }, [serverUrl]);
 
+  useEffect(() => {
+    if (!user) {
+      setProviders([]);
+      setSelectedProvider(null);
+      return;
+    }
+
+    async function loadProviders() {
+      try {
+        const response = await fetch(`${serverUrl.replace(/\/$/, "")}/agent/providers`, {
+          method: "GET",
+          credentials: "include"
+        });
+        if (!response.ok) {
+          setProviders([]);
+          setSelectedProvider(null);
+          return;
+        }
+        const data = (await response.json()) as { providers?: ProviderInfo[] };
+        const nextProviders = data.providers ?? [];
+        setProviders(nextProviders);
+        setSelectedProvider((current) => {
+          if (current && nextProviders.some((provider) => provider.name === current)) {
+            return current;
+          }
+          return preferProvider(nextProviders)?.name ?? null;
+        });
+      } catch {
+        setProviders([]);
+        setSelectedProvider(null);
+      }
+    }
+
+    void loadProviders();
+  }, [serverUrl, user]);
+
+  useEffect(() => {
+    if (!user) {
+      return;
+    }
+
+    async function loadWorkspaceTree() {
+      try {
+        const response = await fetch(`${serverUrl.replace(/\/$/, "")}/workspaces/tree`, {
+          method: "GET",
+          credentials: "include"
+        });
+        if (!response.ok) {
+          return;
+        }
+
+        const data = (await response.json()) as WorkspaceTreeResponse;
+        const nextTree =
+          data.workspaces?.map((workspace) => ({
+            ...workspace,
+            sessions: workspace.sessions.map((session) => ({
+              ...session,
+              serverSessionId: session.id
+            }))
+          })) ?? [];
+
+        setWorkspaceTree(nextTree);
+      } catch {
+        return;
+      }
+    }
+
+    void loadWorkspaceTree();
+  }, [serverUrl, user]);
+
   async function handleLogout() {
     await fetch(`${serverUrl.replace(/\/$/, "")}/auth/logout`, {
       method: "POST",
@@ -257,6 +369,125 @@ export default function AppHome() {
 
   function toggleWorkspace(id: string) {
     setExpanded((prev) => ({ ...prev, [id]: !prev[id] }));
+  }
+
+  async function handleCreateSession() {
+    const workspaceId = selectedWorkspace?.id ?? workspaceTree[0]?.id;
+    if (!workspaceId) {
+      return;
+    }
+
+    try {
+      const response = await fetch(`${serverUrl.replace(/\/$/, "")}/sessions`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          workspaceId,
+          title: "New session"
+        })
+      });
+
+      if (!response.ok) {
+        throw new Error("Could not create session.");
+      }
+
+      const data = (await response.json()) as { session: SessionRecord };
+      const nextSession = {
+        ...data.session,
+        serverSessionId: data.session.id
+      };
+
+      setWorkspaceTree((current) =>
+        current.map((workspace) =>
+          workspace.id === workspaceId
+            ? {
+                ...workspace,
+                sessions: [nextSession, ...workspace.sessions]
+              }
+            : workspace
+        )
+      );
+      setSelectedSessionId(nextSession.id);
+    } catch (error) {
+      setSendError(error instanceof Error ? error.message : "Could not create session.");
+    }
+  }
+
+  function applyReplyToSession(localSessionId: string, userPrompt: string, response: AgentReplyResponse) {
+    setWorkspaceTree((current) =>
+      current.map((workspace) => ({
+        ...workspace,
+        sessions: workspace.sessions.map((session) => {
+          if (session.id !== localSessionId) {
+            return session;
+          }
+
+          const nextMessages: ChatMessage[] = [
+            ...session.messages,
+            {
+              id: `user-${Date.now()}`,
+              role: "user",
+              content: userPrompt,
+              timestamp: formatTimestamp()
+            },
+            {
+              id: response.message.id,
+              role: "assistant",
+              content: response.message.content,
+              timestamp: formatTimestamp(response.message.createdAt)
+            }
+          ];
+
+          return {
+            ...session,
+            serverSessionId: response.sessionId,
+            model: activeProvider?.label ?? session.model,
+            updated: "Just now",
+            status: "Live",
+            messages: nextMessages
+          };
+        })
+      }))
+    );
+  }
+
+  async function handleSend() {
+    if (!selectedSession || !draft.trim() || !activeProvider) {
+      return;
+    }
+
+    setIsSending(true);
+    setSendError(null);
+
+    try {
+      const response = await fetch(`${serverUrl.replace(/\/$/, "")}/agent/reply`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          provider: activeProvider.name,
+          model: activeProvider.defaultModel,
+          sessionId: selectedSession.serverSessionId,
+          message: draft.trim()
+        })
+      });
+
+      if (!response.ok) {
+        const errorBody = (await response.json().catch(() => null)) as
+          | { message?: string; error?: string }
+          | null;
+        throw new Error(errorBody?.message ?? errorBody?.error ?? "Agent request failed.");
+      }
+
+      const result = (await response.json()) as AgentReplyResponse;
+      applyReplyToSession(selectedSession.id, draft.trim(), result);
+      setDraft("");
+    } catch (error) {
+      setSendError(error instanceof Error ? error.message : "Agent request failed.");
+    } finally {
+      setIsSending(false);
+    }
   }
 
   return (
@@ -377,13 +608,15 @@ export default function AppHome() {
                 <Button size="sm" variant="outline" onClick={() => (window.location.href = "/app/settings")}>
                   Settings
                 </Button>
-                <Button size="sm">New session</Button>
+                <Button size="sm" onClick={handleCreateSession}>
+                  New session
+                </Button>
               </div>
             </div>
             {selectedSession ? (
               <div className="mt-3 flex flex-wrap gap-2">
                 <div className="rounded-full border border-border px-3 py-1 text-xs text-muted-foreground">
-                  Model {selectedSession.model}
+                  Provider {activeProvider?.label ?? "Unavailable"}
                 </div>
                 <div className="rounded-full border border-border px-3 py-1 text-xs text-muted-foreground">
                   Branch {selectedSession.branch}
@@ -421,6 +654,13 @@ export default function AppHome() {
                     </div>
                   </div>
                 ))}
+                {isSending ? (
+                  <div className="flex justify-start">
+                    <div className="max-w-3xl rounded-3xl border border-border bg-card px-4 py-3 text-sm text-muted-foreground">
+                      Thinking with {activeProvider?.label ?? "agent"}...
+                    </div>
+                  </div>
+                ) : null}
               </div>
             ) : (
               <div className="mx-auto flex h-full max-w-3xl items-center justify-center">
@@ -470,17 +710,39 @@ export default function AppHome() {
                 />
                 <div className="mt-3 flex items-center justify-between gap-3">
                   <div className="text-xs text-muted-foreground">
-                    Context, files, and tools stay attached to the selected session.
+                    {providers.length > 0
+                      ? `Using ${activeProvider?.label ?? "agent"} for this reply.`
+                      : "No agent providers available yet."}
                   </div>
                   <div className="flex items-center gap-2">
+                    <select
+                      value={selectedProvider ?? ""}
+                      onChange={(event) =>
+                        setSelectedProvider(event.target.value as "codex" | "openrouter")
+                      }
+                      className="h-9 rounded-md border border-border bg-background px-3 text-sm"
+                      disabled={providers.length === 0 || isSending}
+                    >
+                      {providers.length === 0 ? <option value="">No providers</option> : null}
+                      {providers.map((provider) => (
+                        <option key={provider.name} value={provider.name}>
+                          {provider.label}
+                        </option>
+                      ))}
+                    </select>
                     <Button size="sm" variant="outline">
                       Attach
                     </Button>
-                    <Button size="sm" disabled={!selectedSession}>
-                      Send
+                    <Button
+                      size="sm"
+                      disabled={!selectedSession || !draft.trim() || !activeProvider || isSending}
+                      onClick={handleSend}
+                    >
+                      {isSending ? "Sending..." : "Send"}
                     </Button>
                   </div>
                 </div>
+                {sendError ? <div className="mt-3 text-xs text-destructive">{sendError}</div> : null}
               </div>
             </div>
           </div>
@@ -510,10 +772,10 @@ export default function AppHome() {
                         `apps/web/app/app/page.tsx`
                       </div>
                       <div className="rounded-lg border border-border px-3 py-2">
-                        `apps/server/src/routes/auth.ts`
+                        `apps/server/src/routes/agents.ts`
                       </div>
                       <div className="rounded-lg border border-border px-3 py-2">
-                        `packages/shared/src/schemas.ts`
+                        `packages/agent/src/index.ts`
                       </div>
                     </CardContent>
                   ) : null}
@@ -525,8 +787,8 @@ export default function AppHome() {
                   </CardHeader>
                   <CardContent className="space-y-2 text-xs text-muted-foreground">
                     <div className="flex items-center justify-between rounded-lg border border-border px-3 py-2">
-                      <span>Model</span>
-                      <span>{selectedSession?.model ?? "None"}</span>
+                      <span>Provider</span>
+                      <span>{activeProvider?.label ?? "None"}</span>
                     </div>
                     <div className="flex items-center justify-between rounded-lg border border-border px-3 py-2">
                       <span>Branch</span>

@@ -1,6 +1,8 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
+    "typeRoots": ["../../node_modules/.pnpm/@types+node@20.19.37/node_modules/@types"],
+    "types": ["node"],
     "moduleResolution": "Bundler",
     "noEmit": true
   },

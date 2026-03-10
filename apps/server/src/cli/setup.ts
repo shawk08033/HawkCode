@@ -4,9 +4,10 @@ import path from "node:path";
 import { spawnSync } from "node:child_process";
 import bcrypt from "bcryptjs";
 import prompts from "prompts";
+import { Prisma } from "@prisma/client";
 import { setupConfigSchema } from "@hawkcode/shared";
-import { getSetupComplete, setSetupComplete } from "../lib/setup-status";
-import { resolveConfigPath } from "../lib/runtime-config";
+import { getSetupComplete, setSetupComplete } from "../lib/setup-status.js";
+import { resolveConfigPath } from "../lib/runtime-config.js";
 
 type SetupArgs = {
   nonInteractive: boolean;
@@ -45,7 +46,14 @@ async function promptForConfig(nonInteractive: boolean) {
       databaseUrl: cleanValue(getEnvValue("DATABASE_URL")),
       redisUrl: cleanValue(getEnvValue("REDIS_URL")),
       githubAppId: cleanValue(getEnvValue("GITHUB_APP_ID")),
-      githubAppKeyPath: cleanValue(getEnvValue("GITHUB_APP_KEY_PATH"))
+      githubAppKeyPath: cleanValue(getEnvValue("GITHUB_APP_KEY_PATH")),
+      codexPath: cleanValue(getEnvValue("CODEX_PATH")),
+      codexModel: cleanValue(getEnvValue("CODEX_MODEL")),
+      openrouterApiKey: cleanValue(getEnvValue("OPENROUTER_API_KEY")),
+      openrouterBaseUrl: cleanValue(getEnvValue("OPENROUTER_BASE_URL")),
+      openrouterModel: cleanValue(getEnvValue("OPENROUTER_MODEL")),
+      openrouterSiteUrl: cleanValue(getEnvValue("OPENROUTER_SITE_URL")),
+      openrouterAppName: cleanValue(getEnvValue("OPENROUTER_APP_NAME"))
     });
   }
 
@@ -104,6 +112,42 @@ async function promptForConfig(nonInteractive: boolean) {
     },
     {
       type: "text",
+      name: "codexPath",
+      message: "Codex CLI path (optional)",
+      initial: getEnvValue("CODEX_PATH") ?? "codex"
+    },
+    {
+      type: "text",
+      name: "codexModel",
+      message: "Codex default model (optional)",
+      initial: getEnvValue("CODEX_MODEL") ?? "gpt-5"
+    },
+    {
+      type: "text",
+      name: "openrouterApiKey",
+      message: "OpenRouter API key (optional)",
+      initial: getEnvValue("OPENROUTER_API_KEY") ?? ""
+    },
+    {
+      type: "text",
+      name: "openrouterModel",
+      message: "OpenRouter default model (optional)",
+      initial: getEnvValue("OPENROUTER_MODEL") ?? "openai/gpt-5"
+    },
+    {
+      type: "text",
+      name: "openrouterSiteUrl",
+      message: "OpenRouter site URL (optional)",
+      initial: getEnvValue("OPENROUTER_SITE_URL") ?? ""
+    },
+    {
+      type: "text",
+      name: "openrouterAppName",
+      message: "OpenRouter app name (optional)",
+      initial: getEnvValue("OPENROUTER_APP_NAME") ?? ""
+    },
+    {
+      type: "text",
       name: "tlsCertPath",
       message: "TLS certificate path (optional)",
       initial: getEnvValue("HAWKCODE_TLS_CERT_PATH") ?? ""
@@ -125,6 +169,12 @@ async function promptForConfig(nonInteractive: boolean) {
     redisUrl: cleanValue(response.redisUrl),
     githubAppId: cleanValue(response.githubAppId),
     githubAppKeyPath: cleanValue(response.githubAppKeyPath),
+    codexPath: cleanValue(response.codexPath),
+    codexModel: cleanValue(response.codexModel),
+    openrouterApiKey: cleanValue(response.openrouterApiKey),
+    openrouterModel: cleanValue(response.openrouterModel),
+    openrouterSiteUrl: cleanValue(response.openrouterSiteUrl),
+    openrouterAppName: cleanValue(response.openrouterAppName),
     tlsCertPath: cleanValue(response.tlsCertPath),
     tlsKeyPath: cleanValue(response.tlsKeyPath)
   });
@@ -209,6 +259,13 @@ function buildEnvContent(config: {
   redisUrl?: string;
   githubAppId?: string;
   githubAppKeyPath?: string;
+  codexPath?: string;
+  codexModel?: string;
+  openrouterApiKey?: string;
+  openrouterBaseUrl?: string;
+  openrouterModel?: string;
+  openrouterSiteUrl?: string;
+  openrouterAppName?: string;
 }) {
   const lines = [
     `DATABASE_PROVIDER=${config.dbProvider}`,
@@ -223,6 +280,27 @@ function buildEnvContent(config: {
   if (config.githubAppKeyPath) {
     lines.push(`GITHUB_APP_KEY_PATH=${config.githubAppKeyPath}`);
   }
+  if (config.codexPath) {
+    lines.push(`CODEX_PATH=${config.codexPath}`);
+  }
+  if (config.codexModel) {
+    lines.push(`CODEX_MODEL=${config.codexModel}`);
+  }
+  if (config.openrouterApiKey) {
+    lines.push(`OPENROUTER_API_KEY=${config.openrouterApiKey}`);
+  }
+  if (config.openrouterBaseUrl) {
+    lines.push(`OPENROUTER_BASE_URL=${config.openrouterBaseUrl}`);
+  }
+  if (config.openrouterModel) {
+    lines.push(`OPENROUTER_MODEL=${config.openrouterModel}`);
+  }
+  if (config.openrouterSiteUrl) {
+    lines.push(`OPENROUTER_SITE_URL=${config.openrouterSiteUrl}`);
+  }
+  if (config.openrouterAppName) {
+    lines.push(`OPENROUTER_APP_NAME=${config.openrouterAppName}`);
+  }
   return lines.join("\n");
 }
 
@@ -234,6 +312,13 @@ function writeConfigFile(config: {
   dbProvider: string;
   databaseUrl: string;
   redisUrl?: string;
+  codexPath?: string;
+  codexModel?: string;
+  openrouterApiKey?: string;
+  openrouterBaseUrl?: string;
+  openrouterModel?: string;
+  openrouterSiteUrl?: string;
+  openrouterAppName?: string;
   tlsCertPath?: string;
   tlsKeyPath?: string;
 }) {
@@ -242,6 +327,13 @@ function writeConfigFile(config: {
     dbProvider: config.dbProvider,
     databaseUrl: config.databaseUrl,
     ...(config.redisUrl ? { redisUrl: config.redisUrl } : {}),
+    ...(config.codexPath ? { codexPath: config.codexPath } : {}),
+    ...(config.codexModel ? { codexModel: config.codexModel } : {}),
+    ...(config.openrouterApiKey ? { openrouterApiKey: config.openrouterApiKey } : {}),
+    ...(config.openrouterBaseUrl ? { openrouterBaseUrl: config.openrouterBaseUrl } : {}),
+    ...(config.openrouterModel ? { openrouterModel: config.openrouterModel } : {}),
+    ...(config.openrouterSiteUrl ? { openrouterSiteUrl: config.openrouterSiteUrl } : {}),
+    ...(config.openrouterAppName ? { openrouterAppName: config.openrouterAppName } : {}),
     ...(config.tlsCertPath ? { tlsCertPath: config.tlsCertPath } : {}),
     ...(config.tlsKeyPath ? { tlsKeyPath: config.tlsKeyPath } : {})
   };
@@ -291,12 +383,12 @@ async function main() {
     await initializeDatabase(config.dbProvider);
   }
 
-  const { prisma } = await import("../lib/prisma");
+  const { prisma } = await import("../lib/prisma.js");
   await prisma.$connect();
 
   const passwordHash = await bcrypt.hash(config.adminPassword, 12);
 
-  const result = await prisma.$transaction(async (tx) => {
+  const result = await prisma.$transaction(async (tx: Prisma.TransactionClient) => {
     let user = await tx.user.findUnique({ where: { email: config.adminEmail } });
     if (!user) {
       user = await tx.user.create({
@@ -349,7 +441,14 @@ async function main() {
       databaseUrl: config.databaseUrl,
       redisUrl: config.redisUrl,
       githubAppId: config.githubAppId,
-      githubAppKeyPath: config.githubAppKeyPath
+      githubAppKeyPath: config.githubAppKeyPath,
+      codexPath: config.codexPath,
+      codexModel: config.codexModel,
+      openrouterApiKey: config.openrouterApiKey,
+      openrouterBaseUrl: config.openrouterBaseUrl,
+      openrouterModel: config.openrouterModel,
+      openrouterSiteUrl: config.openrouterSiteUrl,
+      openrouterAppName: config.openrouterAppName
     });
     await writeEnvFile(envContent);
   }
@@ -359,6 +458,13 @@ async function main() {
       dbProvider: config.dbProvider,
       databaseUrl: config.databaseUrl,
       redisUrl: config.redisUrl,
+      codexPath: config.codexPath,
+      codexModel: config.codexModel,
+      openrouterApiKey: config.openrouterApiKey,
+      openrouterBaseUrl: config.openrouterBaseUrl,
+      openrouterModel: config.openrouterModel,
+      openrouterSiteUrl: config.openrouterSiteUrl,
+      openrouterAppName: config.openrouterAppName,
       tlsCertPath: config.tlsCertPath,
       tlsKeyPath: config.tlsKeyPath
     });
