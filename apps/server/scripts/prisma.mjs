@@ -20,6 +20,7 @@ function resolveConfigPath() {
 function main() {
   const configPath = resolveConfigPath();
   const env = { ...process.env };
+  let hasDatabaseUrl = false;
 
   if (fs.existsSync(configPath)) {
     const raw = fs.readFileSync(configPath, "utf8");
@@ -27,6 +28,7 @@ function main() {
 
     if (typeof parsed.databaseUrl === "string" && parsed.databaseUrl.length > 0) {
       env.DATABASE_URL = parsed.databaseUrl;
+      hasDatabaseUrl = true;
     }
 
     if (typeof parsed.dbProvider === "string" && parsed.dbProvider.length > 0) {
@@ -34,9 +36,9 @@ function main() {
     }
   }
 
-  if (!env.DATABASE_URL) {
+  if (!hasDatabaseUrl) {
     console.error(
-      'DATABASE_URL is not configured. Set it in hawkcode.config.json or the current shell before running Prisma.'
+      'databaseUrl is not configured in hawkcode.config.json. Run "pnpm setup" first or update the config file before running Prisma.'
     );
     process.exit(1);
   }

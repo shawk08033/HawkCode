@@ -7,22 +7,32 @@ import prompts from "prompts";
 import { Prisma } from "@prisma/client";
 import { setupConfigSchema } from "@hawkcode/shared";
 import { getSetupComplete, setSetupComplete } from "../lib/setup-status.js";
-import { resolveConfigPath } from "../lib/runtime-config.js";
+import {
+  findLegacyProviderEnvVars,
+  resolveConfigPath
+} from "../lib/runtime-config.js";
 
 type SetupArgs = {
   nonInteractive: boolean;
-  writeEnv: boolean;
-  writeConfig: boolean;
 };
-
-const DEFAULT_ENV_PATH = path.resolve(process.cwd(), ".env");
 
 function parseArgs(argv: string[]): SetupArgs {
   const nonInteractive = argv.includes("--non-interactive") ||
     process.env.HAWKCODE_NONINTERACTIVE === "1";
-  const writeEnv = argv.includes("--write-env") || process.env.HAWKCODE_WRITE_ENV === "1";
-  const writeConfig = !argv.includes("--no-config");
-  return { nonInteractive, writeEnv, writeConfig };
+
+  if (argv.includes("--write-env") || process.env.HAWKCODE_WRITE_ENV === "1") {
+    throw new Error(
+      'The "--write-env" flow has been removed. HawkCode runtime settings now live in hawkcode.config.json.'
+    );
+  }
+
+  if (argv.includes("--no-config")) {
+    throw new Error(
+      'The "--no-config" flow has been removed. HawkCode now requires hawkcode.config.json.'
+    );
+  }
+
+  return { nonInteractive };
 }
 
 function getEnvValue(key: string): string | undefined {
@@ -253,38 +263,15 @@ async function initializeDatabase(dbProvider: "postgresql" | "sqlite") {
   runPrismaCommand(["generate"]);
 }
 
-function buildEnvContent(config: {
-  dbProvider: string;
-  databaseUrl: string;
-  redisUrl?: string;
-  githubAppId?: string;
-  githubAppKeyPath?: string;
-  codexPath?: string;
-  codexModel?: string;
-  openrouterApiKey?: string;
-  openrouterBaseUrl?: string;
-  openrouterModel?: string;
-  openrouterSiteUrl?: string;
-  openrouterAppName?: string;
-}) {
-  const lines = [
-    `DATABASE_PROVIDER=${config.dbProvider}`,
-    `DATABASE_URL=${config.databaseUrl}`
-  ];
-  if (config.redisUrl) {
-    lines.push(`REDIS_URL=${config.redisUrl}`);
+function logLegacyProviderEnvMigration() {
+  const legacyVars = findLegacyProviderEnvVars();
+  if (legacyVars.length === 0) {
+    return;
   }
-  if (config.githubAppId) {
-    lines.push(`GITHUB_APP_ID=${config.githubAppId}`);
-  }
-  if (config.githubAppKeyPath) {
-    lines.push(`GITHUB_APP_KEY_PATH=${config.githubAppKeyPath}`);
-  }
-  return lines.join("\n");
-}
 
-async function writeEnvFile(content: string) {
-  fs.writeFileSync(DEFAULT_ENV_PATH, `${content}\n`, "utf8");
+  console.warn(
+    `Ignoring legacy provider env vars: ${legacyVars.join(", ")}. Move provider settings into hawkcode.config.json.`
+  );
 }
 
 function writeConfigFile(config: {
@@ -321,6 +308,7 @@ function writeConfigFile(config: {
 
 async function main() {
   const args = parseArgs(process.argv.slice(2));
+  logLegacyProviderEnvMigration();
   const alreadySetup = await getSetupComplete();
   const configPath = resolveConfigPath();
   const hasConfig = fs.existsSync(configPath);
@@ -414,43 +402,25 @@ async function main() {
 
   await setSetupComplete(true);
 
-  if (args.writeEnv) {
-    const envContent = buildEnvContent({
-      dbProvider: config.dbProvider,
-      databaseUrl: config.databaseUrl,
-      redisUrl: config.redisUrl,
-      githubAppId: config.githubAppId,
-      githubAppKeyPath: config.githubAppKeyPath,
-      codexPath: config.codexPath,
-      codexModel: config.codexModel,
-      openrouterApiKey: config.openrouterApiKey,
-      openrouterBaseUrl: config.openrouterBaseUrl,
-      openrouterModel: config.openrouterModel,
-      openrouterSiteUrl: config.openrouterSiteUrl,
-      openrouterAppName: config.openrouterAppName
-    });
-    await writeEnvFile(envContent);
-  }
-
-  if (args.writeConfig) {
-    writeConfigFile({
-      dbProvider: config.dbProvider,
-      databaseUrl: config.databaseUrl,
-      redisUrl: config.redisUrl,
-      codexPath: config.codexPath,
-      codexModel: config.codexModel,
-      openrouterApiKey: config.openrouterApiKey,
-      openrouterBaseUrl: config.openrouterBaseUrl,
-      openrouterModel: config.openrouterModel,
-      openrouterSiteUrl: config.openrouterSiteUrl,
-      openrouterAppName: config.openrouterAppName,
-      tlsCertPath: config.tlsCertPath,
-      tlsKeyPath: config.tlsKeyPath
-    });
-  }
+  writeConfigFile({
+    dbProvider: config.dbProvider,
+    databaseUrl: config.databaseUrl,
+    redisUrl: config.redisUrl,
+    codexPath: config.codexPath,
+    codexModel: config.codexModel,
+    openrouterApiKey: config.openrouterApiKey,
+    openrouterBaseUrl: config.openrouterBaseUrl,
+    openrouterModel: config.openrouterModel,
+    openrouterSiteUrl: config.openrouterSiteUrl,
+    openrouterAppName: config.openrouterAppName,
+    tlsCertPath: config.tlsCertPath,
+    tlsKeyPath: config.tlsKeyPath
+  });
 
   console.log(`Setup complete. Admin user: ${result.user.email}`);
   console.log(`Workspace: ${result.workspace.name}`);
+  console.log(`Runtime config: ${configPath}`);
+  console.log("Runtime and provider settings are loaded from hawkcode.config.json.");
   if (!config.redisUrl) {
     console.log("Redis not configured. Running in degraded mode.");
   }

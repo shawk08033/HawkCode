@@ -20,6 +20,16 @@ const configSchema = z.object({
 export type RuntimeConfig = z.infer<typeof configSchema>;
 
 const CONFIG_FILENAME = "hawkcode.config.json";
+const LEGACY_PROVIDER_ENV_VARS = [
+  "CODEX_PATH",
+  "CODEX_MODEL",
+  "OPENROUTER_API_KEY",
+  "OPENROUTER_BASE_URL",
+  "OPENROUTER_MODEL",
+  "OPENROUTER_SITE_URL",
+  "OPENROUTER_APP_NAME"
+] as const;
+let warnedLegacyProviderEnvVars = false;
 
 export function resolveConfigPath() {
   const cwd = process.cwd();
@@ -52,4 +62,27 @@ export function loadRuntimeConfig(): RuntimeConfig | null {
     tlsCertPath: resolveMaybe(config.tlsCertPath),
     tlsKeyPath: resolveMaybe(config.tlsKeyPath)
   };
+}
+
+export function findLegacyProviderEnvVars(env: NodeJS.ProcessEnv = process.env) {
+  return LEGACY_PROVIDER_ENV_VARS.filter((name) => {
+    const value = env[name];
+    return typeof value === "string" && value.trim().length > 0;
+  });
+}
+
+export function warnOnLegacyProviderEnvVars(logger: Pick<Console, "warn"> = console) {
+  if (warnedLegacyProviderEnvVars) {
+    return;
+  }
+
+  const legacyVars = findLegacyProviderEnvVars();
+  if (legacyVars.length === 0) {
+    return;
+  }
+
+  warnedLegacyProviderEnvVars = true;
+  logger.warn(
+    `Ignoring legacy provider env vars: ${legacyVars.join(", ")}. Move provider settings into ${CONFIG_FILENAME}.`
+  );
 }

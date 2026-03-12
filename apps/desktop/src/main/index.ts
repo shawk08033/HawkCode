@@ -3,9 +3,12 @@ import path from "node:path";
 import fs from "node:fs";
 import { execFile, spawn } from "node:child_process";
 import { promises as fsp } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { promisify } from "node:util";
-import Store from "electron-store";
+
+const require = createRequire(import.meta.url);
+const Store = require("electron-store") as typeof import("electron-store");
 
 const isDev = !app.isPackaged;
 const allowSelfSigned = isDev;
