@@ -1071,15 +1071,15 @@ export default function App() {
   }
 
   return (
-    <div className="min-h-screen bg-background text-foreground">
-      <div className="grid min-h-screen grid-cols-[240px_1fr_300px]">
-        <aside className="flex flex-col border-r border-border bg-card px-3 py-3">
+    <div className="h-full overflow-hidden bg-background text-foreground">
+      <div className="grid h-full min-h-0 grid-cols-[240px_minmax(0,1fr)_300px] overflow-hidden">
+        <aside className="flex min-h-0 flex-col overflow-hidden border-r border-border bg-card px-3 py-3">
           <div className="space-y-1">
             <div className="text-sm font-semibold">HawkCode</div>
             <div className="text-[11px] text-muted-foreground">{authUser}</div>
           </div>
           <Separator className="my-3" />
-          <div className="space-y-3 overflow-y-auto pr-1">
+          <div className="min-h-0 flex-1 space-y-3 overflow-y-auto pr-1">
             <div className="flex items-center justify-between">
               <div className="text-[10px] uppercase tracking-[0.2em] text-muted-foreground">
                 Workspaces
@@ -1156,7 +1156,7 @@ export default function App() {
           </div>
         </aside>
 
-        <main className="flex min-h-screen flex-col">
+        <main className="flex min-h-0 flex-col overflow-hidden">
           <div className="border-b border-border px-6 py-4">
             <div className="flex items-start justify-between gap-4">
               <div className="space-y-2">
@@ -1206,9 +1206,9 @@ export default function App() {
             ) : null}
           </div>
 
-          <div className="flex-1 overflow-y-auto px-6 py-5">
+          <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-6 py-5">
             {selectedSession ? (
-              <div className="mx-auto flex max-w-4xl flex-col gap-4">
+              <div className="mx-auto flex max-w-4xl flex-col gap-4 pb-8">
                 {selectedSession.messages.map((message) => (
                   <div
                     key={message.id}
@@ -1257,100 +1257,101 @@ export default function App() {
               </div>
             )}
           </div>
-
-          <div className="border-t border-border px-6 py-4">
-            <div className="mx-auto max-w-4xl space-y-3">
-              <div className="flex flex-wrap gap-2">
-                <button
-                  type="button"
-                  onClick={() => setDraft("Summarize the current branch and propose the next implementation step.")}
-                  className="rounded-full border border-border px-3 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent"
-                >
-                  Summarize branch
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setDraft("Review the latest changes and list the highest-risk regressions.")}
-                  className="rounded-full border border-border px-3 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent"
-                >
-                  Review latest changes
-                </button>
-                <button
-                  type="button"
-                  onClick={() => setDraft("Draft a plan for the next UI milestone in this workspace.")}
-                  className="rounded-full border border-border px-3 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent"
-                >
-                  Plan next milestone
-                </button>
-              </div>
-              <div className="rounded-3xl border border-border bg-card p-3 shadow-sm">
-                <textarea
-                  value={draft}
-                  onChange={(event) => setDraft(event.target.value)}
-                  onKeyDown={(event) => {
-                    if (event.key === "Enter" && !event.shiftKey) {
-                      event.preventDefault();
-                      if (selectedSession && draft.trim() && activeProvider && !isSending) {
-                        void handleSend();
-                      }
-                    }
-                  }}
-                  placeholder="Message HawkCode about this session..."
-                  className="min-h-28 w-full resize-none bg-transparent text-sm leading-6 text-foreground outline-none placeholder:text-muted-foreground"
-                />
-                <div className="mt-3 flex items-center justify-between gap-3">
-                  <div className="text-xs text-muted-foreground">
-                    {availableProviders.length > 0
-                      ? `Using ${activeProvider?.label ?? "agent"}${selectedModel ? ` · ${selectedModel}` : ""} for this reply.`
-                      : "No agent providers available yet."}
-                  </div>
-                  <div className="flex items-center gap-2">
-                    <select
-                      value={selectedProvider ?? ""}
-                      onChange={(event) =>
-                        setSelectedProvider(event.target.value as "codex" | "openrouter")
-                      }
-                      className="h-9 rounded-md border border-border bg-background px-3 text-sm"
-                      disabled={availableProviders.length === 0 || isSending}
-                    >
-                      {availableProviders.length === 0 ? <option value="">No providers</option> : null}
-                      {availableProviders.map((provider) => (
-                        <option key={provider.name} value={provider.name}>
-                          {provider.label}
-                        </option>
-                      ))}
-                    </select>
-                    <select
-                      value={selectedModel}
-                      onChange={(event) => setSelectedModel(event.target.value)}
-                      className="h-9 w-44 rounded-md border border-border bg-background px-3 text-sm"
-                      disabled={!activeProvider || isSending}
-                    >
-                      {availableModels.map((model) => (
-                        <option key={model} value={model}>
-                          {model}
-                        </option>
-                      ))}
-                    </select>
-                    <Button size="sm" variant="outline">
-                      Attach
-                    </Button>
-                    <Button
-                      size="sm"
-                      disabled={!selectedSession || !draft.trim() || !activeProvider || isSending}
-                      onClick={handleSend}
-                    >
-                      {isSending ? "Sending..." : "Send"}
-                    </Button>
-                  </div>
+          {selectedSession ? (
+            <div className="bg-gradient-to-t from-background via-background/95 to-background/0 px-6 pb-5 pt-4">
+              <div className="mx-auto max-w-4xl space-y-3">
+                <div className="flex flex-wrap gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setDraft("Summarize the current branch and propose the next implementation step.")}
+                    className="rounded-full border border-border/70 px-3 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent"
+                  >
+                    Summarize branch
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDraft("Review the latest changes and list the highest-risk regressions.")}
+                    className="rounded-full border border-border/70 px-3 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent"
+                  >
+                    Review latest changes
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setDraft("Draft a plan for the next UI milestone in this workspace.")}
+                    className="rounded-full border border-border/70 px-3 py-1 text-xs text-muted-foreground transition-colors hover:bg-accent"
+                  >
+                    Plan next milestone
+                  </button>
                 </div>
-                {sendError ? <div className="mt-3 text-xs text-destructive">{sendError}</div> : null}
+                <div className="rounded-[28px] border border-border/60 bg-card/70 px-4 py-3 shadow-[0_8px_30px_rgba(0,0,0,0.18)] backdrop-blur-sm">
+                  <textarea
+                    value={draft}
+                    onChange={(event) => setDraft(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === "Enter" && !event.shiftKey) {
+                        event.preventDefault();
+                        if (selectedSession && draft.trim() && activeProvider && !isSending) {
+                          void handleSend();
+                        }
+                      }
+                    }}
+                    placeholder="Message HawkCode about this session..."
+                    className="min-h-28 w-full resize-none bg-transparent text-sm leading-6 text-foreground outline-none placeholder:text-muted-foreground"
+                  />
+                  <div className="mt-3 flex items-center justify-between gap-3">
+                    <div className="text-xs text-muted-foreground">
+                      {availableProviders.length > 0
+                        ? `Using ${activeProvider?.label ?? "agent"}${selectedModel ? ` · ${selectedModel}` : ""} for this reply.`
+                        : "No agent providers available yet."}
+                    </div>
+                    <div className="flex items-center gap-2">
+                      <select
+                        value={selectedProvider ?? ""}
+                        onChange={(event) =>
+                          setSelectedProvider(event.target.value as "codex" | "openrouter")
+                        }
+                        className="h-9 rounded-md border border-border bg-background px-3 text-sm"
+                        disabled={availableProviders.length === 0 || isSending}
+                      >
+                        {availableProviders.length === 0 ? <option value="">No providers</option> : null}
+                        {availableProviders.map((provider) => (
+                          <option key={provider.name} value={provider.name}>
+                            {provider.label}
+                          </option>
+                        ))}
+                      </select>
+                      <select
+                        value={selectedModel}
+                        onChange={(event) => setSelectedModel(event.target.value)}
+                        className="h-9 w-44 rounded-md border border-border bg-background px-3 text-sm"
+                        disabled={!activeProvider || isSending}
+                      >
+                        {availableModels.map((model) => (
+                          <option key={model} value={model}>
+                            {model}
+                          </option>
+                        ))}
+                      </select>
+                      <Button size="sm" variant="outline">
+                        Attach
+                      </Button>
+                      <Button
+                        size="sm"
+                        disabled={!selectedSession || !draft.trim() || !activeProvider || isSending}
+                        onClick={handleSend}
+                      >
+                        {isSending ? "Sending..." : "Send"}
+                      </Button>
+                    </div>
+                  </div>
+                  {sendError ? <div className="mt-3 text-xs text-destructive">{sendError}</div> : null}
+                </div>
               </div>
             </div>
-          </div>
+          ) : null}
         </main>
 
-        <aside className="border-l border-border px-4 py-4">
+        <aside className="min-h-0 overflow-y-auto border-l border-border px-4 py-4">
           <Tabs defaultValue="context">
             <TabsList>
               <TabsTrigger value="context">Context</TabsTrigger>
