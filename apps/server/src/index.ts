@@ -7,10 +7,14 @@ import { getSetupComplete } from "./lib/setup-status.js";
 import { registerAuthRoutes } from "./routes/auth.js";
 import { registerAgentRoutes } from "./routes/agents.js";
 import { registerWorkspaceRoutes } from "./routes/workspaces.js";
-import { loadRuntimeConfig } from "./lib/runtime-config.js";
+import {
+  loadRuntimeConfig,
+  warnOnLegacyProviderEnvVars
+} from "./lib/runtime-config.js";
 import fs from "node:fs";
 
 const runtimeConfig = loadRuntimeConfig();
+warnOnLegacyProviderEnvVars();
 let httpsConfig = {} as { https?: { cert: Buffer; key: Buffer } };
 if (runtimeConfig?.tlsCertPath && runtimeConfig?.tlsKeyPath) {
   try {

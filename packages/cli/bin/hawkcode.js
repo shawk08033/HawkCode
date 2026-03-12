@@ -5,7 +5,7 @@ const args = process.argv.slice(2);
 const command = args[0];
 
 if (!command || command === "help" || command === "--help" || command === "-h") {
-  console.log("hawkcode setup [--non-interactive] [--write-env]");
+  console.log("hawkcode setup [--non-interactive]");
   process.exit(0);
 }
 

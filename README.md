@@ -33,7 +33,13 @@ pnpm -C apps/server prisma generate
 pnpm setup
 ```
 
-This writes `hawkcode.config.json` and bootstraps the server database. Prisma commands in `apps/server` read `databaseUrl` from that config automatically, so you do not need to export `DATABASE_URL` for normal repo workflows.
+This writes `hawkcode.config.json` and bootstraps the server database.
+
+HawkCode runtime settings live in `hawkcode.config.json`. Provider settings such as `codexPath`, `codexModel`, `openrouterApiKey`, `openrouterModel`, `openrouterSiteUrl`, and `openrouterAppName` are loaded from that file, not from `CODEX_*` or `OPENROUTER_*` environment variables.
+
+Prisma commands in `apps/server` read `databaseUrl` from `hawkcode.config.json` automatically, so normal repo workflows do not need `DATABASE_URL` in the shell after setup.
+
+If you previously configured providers with environment variables, move those values into `hawkcode.config.json` before upgrading. Legacy `CODEX_*` and `OPENROUTER_*` variables are ignored.
 
 ## Desktop Codex
 
