@@ -43,6 +43,34 @@ type WorkspaceRecord = {
   schedules: Array<{ id: string; title: string }>;
 };
 
+type WorkspaceGithubRepo = {
+  id: string;
+  provider: string;
+  repoUrl: string;
+  repoName: string;
+  projectId: string;
+  projectName: string;
+  githubInstallId?: string | null;
+  connectedAt: string;
+};
+
+type GitHubUserRecord = {
+  login: string;
+  name?: string | null;
+  email?: string | null;
+  avatarUrl?: string | null;
+  scope?: string | null;
+  connectedAt: string;
+};
+
+type WorkspaceGithubState = {
+  authConfigured: boolean;
+  connected: boolean;
+  user: GitHubUserRecord | null;
+  canManage: boolean;
+  repos: WorkspaceGithubRepo[];
+};
+
 type AgentReplyResponse = {
   sessionId: string;
   agentRunId: string;
@@ -69,12 +97,81 @@ type WorkspaceTreeResponse = {
   workspaces?: WorkspaceRecord[];
 };
 
+type WorkspaceGithubResponse = {
+  github?: WorkspaceGithubState;
+};
+
+type WorkspaceGitLocalState = {
+  path: string;
+  branch: string;
+  clean: boolean;
+  changedFiles: number;
+  stagedFiles: number;
+  modifiedFiles: number;
+  deletedFiles: number;
+  untrackedFiles: number;
+  ahead: number;
+  behind: number;
+  lastCommit: {
+    sha: string;
+    shortSha: string;
+    subject: string;
+    committedAt: string;
+  };
+};
+
+type WorkspaceGitRepo = WorkspaceGithubRepo & {
+  local: WorkspaceGitLocalState | null;
+};
+
+type WorkspaceGitState = {
+  detected: boolean;
+  localRepoUrl: string | null;
+  localPath: string | null;
+  repos: WorkspaceGitRepo[];
+};
+
+type WorkspaceGitResponse = {
+  git?: WorkspaceGitState;
+};
+
+type GitHubDeviceStartResponse = {
+  deviceCode: string;
+  userCode: string;
+  verificationUri: string;
+  intervalSeconds: number;
+  expiresAt: string;
+};
+
+type GitHubDevicePollResponse = {
+  status?: "pending" | "slow_down" | "connected" | "error";
+  message?: string;
+  error?: string;
+  intervalSeconds?: number;
+  github?: {
+    authConfigured: boolean;
+    connected: boolean;
+    user: GitHubUserRecord | null;
+  };
+};
+
+type GitHubAuthState = {
+  inProgress: boolean;
+  deviceCode?: string;
+  userCode?: string;
+  verificationUri?: string;
+  intervalSeconds?: number;
+  expiresAt?: string;
+  statusText?: string;
+  error?: string;
+};
+
 type MessageSegment =
   | { type: "text"; content: string }
   | { type: "code"; content: string; language?: string };
 
 const IS_DEV = !window.hawkcode?.version ? false : true;
-const DEFAULT_URL = IS_DEV ? "http://localhost:3001" : "https://localhost:3001";
+const DEFAULT_URL = "https://localhost:3001";
 
 function formatTimestamp(value?: string) {
   if (!value) {
@@ -185,6 +282,10 @@ function createInitialWorkspaces(): WorkspaceRecord[] {
       schedules: [{ id: "sch-3", title: "Dependency audit" }]
     }
   ];
+}
+
+function isPlaceholderWorkspaceId(workspaceId?: string | null) {
+  return Boolean(workspaceId && /^ws-\d+$/.test(workspaceId));
 }
 
 function preferProvider(providers: ProviderInfo[]) {
@@ -474,7 +575,8 @@ function renderMessageContent(
 }
 
 export default function App() {
-  const [serverUrl, setServerUrl] = useState(DEFAULT_URL);
+  const [serverUrl, setServerUrl] = useState("");
+  const [serverConfigLoaded, setServerConfigLoaded] = useState(false);
   const [status, setStatus] = useState<Status>({ state: "idle" });
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
@@ -495,6 +597,18 @@ export default function App() {
   const [serverProviders, setServerProviders] = useState<ProviderInfo[]>([]);
   const [codexAuth, setCodexAuth] = useState<CodexAuthStatus>({
     loggedIn: false,
+    inProgress: false
+  });
+  const [workspaceGithub, setWorkspaceGithub] = useState<WorkspaceGithubState | null>(null);
+  const [workspaceGit, setWorkspaceGit] = useState<WorkspaceGitState | null>(null);
+  const [isLoadingGithub, setIsLoadingGithub] = useState(false);
+  const [isLoadingGit, setIsLoadingGit] = useState(false);
+  const [isConnectingGithub, setIsConnectingGithub] = useState(false);
+  const [githubError, setGithubError] = useState<string | null>(null);
+  const [gitError, setGitError] = useState<string | null>(null);
+  const [githubRepoUrl, setGithubRepoUrl] = useState("");
+  const [githubProjectName, setGithubProjectName] = useState("");
+  const [githubAuth, setGithubAuth] = useState<GitHubAuthState>({
     inProgress: false
   });
 
@@ -522,12 +636,76 @@ export default function App() {
     preferProvider(availableProviders);
   const availableModels = useMemo(() => getModelOptions(activeProvider), [activeProvider]);
 
-  useEffect(() => {
-    window.hawkcode.getServerConfig().then((config) => {
-      if (config.serverUrl) {
-        setServerUrl(config.serverUrl);
+  async function loadWorkspaceGithub(workspaceId: string) {
+    setIsLoadingGithub(true);
+    setGithubError(null);
+
+    try {
+      const response = await fetch(`${serverUrl.replace(/\/$/, "")}/workspaces/${workspaceId}/github`, {
+        method: "GET",
+        credentials: "include"
+      });
+      if (!response.ok) {
+        throw new Error("Could not load GitHub workspace settings.");
       }
-    });
+
+      const data = (await response.json()) as WorkspaceGithubResponse;
+      setWorkspaceGithub(
+        data.github ?? {
+          authConfigured: false,
+          connected: false,
+          user: null,
+          canManage: false,
+          repos: []
+        }
+      );
+    } catch (error) {
+      setWorkspaceGithub(null);
+      setGithubError(error instanceof Error ? error.message : "Could not load GitHub workspace settings.");
+    } finally {
+      setIsLoadingGithub(false);
+    }
+  }
+
+  async function loadWorkspaceGit(workspaceId: string) {
+    setIsLoadingGit(true);
+    setGitError(null);
+
+    try {
+      const response = await fetch(`${serverUrl.replace(/\/$/, "")}/workspaces/${workspaceId}/git`, {
+        method: "GET",
+        credentials: "include"
+      });
+      if (!response.ok) {
+        throw new Error("Could not load Git workspace status.");
+      }
+
+      const data = (await response.json()) as WorkspaceGitResponse;
+      setWorkspaceGit(
+        data.git ?? {
+          detected: false,
+          localRepoUrl: null,
+          localPath: null,
+          repos: []
+        }
+      );
+    } catch (error) {
+      setWorkspaceGit(null);
+      setGitError(error instanceof Error ? error.message : "Could not load Git workspace status.");
+    } finally {
+      setIsLoadingGit(false);
+    }
+  }
+
+  useEffect(() => {
+    window.hawkcode
+      .getServerConfig()
+      .then((config) => {
+        setServerUrl(config.serverUrl || DEFAULT_URL);
+      })
+      .finally(() => {
+        setServerConfigLoaded(true);
+      });
   }, []);
 
   useEffect(() => {
@@ -569,6 +747,10 @@ export default function App() {
   }, [activeProvider, availableModels]);
 
   useEffect(() => {
+    if (!serverConfigLoaded || !serverUrl) {
+      return;
+    }
+
     async function checkAuth() {
       try {
         const response = await fetch(`${serverUrl.replace(/\/$/, "")}/auth/me`, {
@@ -586,13 +768,11 @@ export default function App() {
       }
     }
 
-    if (serverUrl) {
-      void checkAuth();
-    }
-  }, [serverUrl]);
+    void checkAuth();
+  }, [serverConfigLoaded, serverUrl]);
 
   useEffect(() => {
-    if (!authUser) {
+    if (!serverConfigLoaded || !authUser) {
       setServerProviders([]);
       setSelectedProvider(null);
       return;
@@ -626,10 +806,10 @@ export default function App() {
     }
 
     void loadProviders();
-  }, [authUser, serverUrl, codexAuth.loggedIn]);
+  }, [authUser, codexAuth.loggedIn, serverConfigLoaded, serverUrl]);
 
   useEffect(() => {
-    if (!authUser) {
+    if (!serverConfigLoaded || !authUser) {
       setCodexAuth({
         loggedIn: false,
         inProgress: false
@@ -650,7 +830,7 @@ export default function App() {
     }
 
     void loadCodexAuthStatus();
-  }, [authUser, serverUrl]);
+  }, [authUser, serverConfigLoaded, serverUrl]);
 
   useEffect(() => {
     if (!codexAuth.inProgress) {
@@ -667,11 +847,12 @@ export default function App() {
   }, [codexAuth.inProgress]);
 
   useEffect(() => {
-    if (!authUser) {
+    if (!serverConfigLoaded || !authUser) {
       return;
     }
 
     async function loadWorkspaceTree() {
+      setWorkspaceTree([]);
       try {
         const response = await fetch(`${serverUrl.replace(/\/$/, "")}/workspaces/tree`, {
           method: "GET",
@@ -698,7 +879,49 @@ export default function App() {
     }
 
     void loadWorkspaceTree();
-  }, [authUser, serverUrl]);
+  }, [authUser, serverConfigLoaded, serverUrl]);
+
+  useEffect(() => {
+    setGithubRepoUrl("");
+    setGithubProjectName("");
+    setGithubError(null);
+    setGitError(null);
+    setGithubAuth({
+      inProgress: false
+    });
+  }, [selectedWorkspace?.id]);
+
+  useEffect(() => {
+    if (
+      !serverConfigLoaded ||
+      !authUser ||
+      !selectedWorkspace?.id ||
+      isPlaceholderWorkspaceId(selectedWorkspace.id)
+    ) {
+      setWorkspaceGithub(null);
+      setIsLoadingGithub(false);
+      setGithubError(null);
+      return;
+    }
+
+    void loadWorkspaceGithub(selectedWorkspace.id);
+  }, [authUser, selectedWorkspace?.id, serverConfigLoaded, serverUrl]);
+
+  useEffect(() => {
+    if (
+      !serverConfigLoaded ||
+      !authUser ||
+      !selectedWorkspace?.id ||
+      isPlaceholderWorkspaceId(selectedWorkspace.id)
+    ) {
+      setWorkspaceGit(null);
+      setIsLoadingGit(false);
+      setGitError(null);
+      return;
+    }
+
+    void loadWorkspaceGit(selectedWorkspace.id);
+  }, [authUser, selectedWorkspace?.id, serverConfigLoaded, serverUrl]);
 
   async function handleCheck() {
     if (serverUrl.startsWith("http://") && !IS_DEV) {
@@ -986,6 +1209,223 @@ export default function App() {
       setSendError(error instanceof Error ? error.message : "Agent request failed.");
     } finally {
       setIsSending(false);
+    }
+  }
+
+  useEffect(() => {
+    if (!githubAuth.inProgress || !githubAuth.deviceCode) {
+      return;
+    }
+
+    let cancelled = false;
+    let nextIntervalSeconds = Math.max(5, githubAuth.intervalSeconds ?? 5);
+    let timer: number | undefined;
+
+    function scheduleNextPoll() {
+      if (cancelled) {
+        return;
+      }
+
+      timer = window.setTimeout(() => {
+        void pollGitHubAuth();
+      }, nextIntervalSeconds * 1000);
+    }
+
+    async function pollGitHubAuth() {
+      try {
+        const response = await fetch(`${serverUrl.replace(/\/$/, "")}/auth/github/device/poll`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({
+            deviceCode: githubAuth.deviceCode
+          })
+        });
+
+        const data = (await response.json().catch(() => null)) as GitHubDevicePollResponse | null;
+        if (cancelled) {
+          return;
+        }
+
+        if (response.ok && (data?.status === "pending" || data?.status === "slow_down")) {
+          if (data.status === "slow_down") {
+            nextIntervalSeconds += Math.max(5, data.intervalSeconds ?? 5);
+          } else if (data.intervalSeconds) {
+            nextIntervalSeconds = Math.max(5, data.intervalSeconds);
+          }
+
+          setGithubAuth((current) =>
+            current.inProgress
+              ? {
+                  ...current,
+                  intervalSeconds: nextIntervalSeconds,
+                  statusText: data.message ?? "Waiting for GitHub approval..."
+                }
+              : current
+          );
+          scheduleNextPoll();
+          return;
+        }
+
+        if (response.ok && data?.status === "connected") {
+          setGithubAuth({
+            inProgress: false,
+            statusText: data.github?.user?.login
+              ? `Connected as ${data.github.user.login}.`
+              : "GitHub connected."
+          });
+          if (selectedWorkspace?.id) {
+            await loadWorkspaceGithub(selectedWorkspace.id);
+          }
+          return;
+        }
+
+        setGithubAuth({
+          inProgress: false,
+          error: data?.message ?? data?.error ?? "GitHub authentication failed."
+        });
+      } catch (error) {
+        if (!cancelled) {
+          setGithubAuth({
+            inProgress: false,
+            error: error instanceof Error ? error.message : "GitHub authentication failed."
+          });
+        }
+      }
+    }
+
+    scheduleNextPoll();
+
+    return () => {
+      cancelled = true;
+      if (timer) {
+        window.clearTimeout(timer);
+      }
+    };
+  }, [
+    githubAuth.deviceCode,
+    githubAuth.inProgress,
+    githubAuth.intervalSeconds,
+    selectedWorkspace?.id,
+    serverUrl
+  ]);
+
+  async function handleStartGitHubAuth() {
+    setGithubError(null);
+    setGithubAuth({
+      inProgress: false
+    });
+
+    try {
+      const response = await fetch(`${serverUrl.replace(/\/$/, "")}/auth/github/device/start`, {
+        method: "POST",
+        credentials: "include"
+      });
+
+      const data = (await response.json().catch(() => null)) as
+        | (GitHubDeviceStartResponse & { error?: string })
+        | null;
+      if (!response.ok || !data?.deviceCode || !data.userCode || !data.verificationUri) {
+        throw new Error(data?.error ?? "Could not start GitHub authentication.");
+      }
+
+      setGithubAuth({
+        inProgress: true,
+        deviceCode: data.deviceCode,
+        userCode: data.userCode,
+        verificationUri: data.verificationUri,
+        intervalSeconds: data.intervalSeconds,
+        expiresAt: data.expiresAt,
+        statusText: "Open GitHub in your browser and enter the code."
+      });
+      await window.hawkcode.openExternalUrl(data.verificationUri);
+    } catch (error) {
+      setGithubAuth({
+        inProgress: false,
+        error: error instanceof Error ? error.message : "Could not start GitHub authentication."
+      });
+    }
+  }
+
+  async function handleDisconnectGitHub() {
+    try {
+      const response = await fetch(`${serverUrl.replace(/\/$/, "")}/auth/github`, {
+        method: "DELETE",
+        credentials: "include"
+      });
+      if (!response.ok) {
+        throw new Error("Could not disconnect GitHub.");
+      }
+
+      setGithubAuth({
+        inProgress: false,
+        statusText: "GitHub disconnected."
+      });
+      if (selectedWorkspace?.id) {
+        await loadWorkspaceGithub(selectedWorkspace.id);
+      }
+    } catch (error) {
+      setGithubAuth({
+        inProgress: false,
+        error: error instanceof Error ? error.message : "Could not disconnect GitHub."
+      });
+    }
+  }
+
+  async function handleConnectGithub() {
+    if (!selectedWorkspace?.id || !githubRepoUrl.trim() || !workspaceGithub?.connected) {
+      return;
+    }
+
+    setIsConnectingGithub(true);
+    setGithubError(null);
+
+    try {
+      const response = await fetch(
+        `${serverUrl.replace(/\/$/, "")}/workspaces/${selectedWorkspace.id}/github/connect`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({
+            repoUrl: githubRepoUrl.trim(),
+            ...(githubProjectName.trim() ? { projectName: githubProjectName.trim() } : {})
+          })
+        }
+      );
+
+      const data = (await response.json().catch(() => null)) as
+        | { repo?: WorkspaceGithubRepo; message?: string; error?: string }
+        | null;
+      if (!response.ok || !data?.repo) {
+        throw new Error(data?.message ?? data?.error ?? "Could not connect GitHub repo.");
+      }
+
+      const repo = data.repo;
+      setWorkspaceGithub((current) => {
+        const nextRepos = [...(current?.repos ?? [])];
+        const existingIndex = nextRepos.findIndex((currentRepo) => currentRepo.id === repo.id);
+        if (existingIndex >= 0) {
+          nextRepos[existingIndex] = repo;
+        } else {
+          nextRepos.unshift(repo);
+        }
+
+        return {
+          authConfigured: current?.authConfigured ?? false,
+          connected: current?.connected ?? true,
+          user: current?.user ?? null,
+          canManage: current?.canManage ?? true,
+          repos: nextRepos
+        };
+      });
+      setGithubRepoUrl("");
+      setGithubProjectName("");
+      await loadWorkspaceGit(selectedWorkspace.id);
+    } catch (error) {
+      setGithubError(error instanceof Error ? error.message : "Could not connect GitHub repo.");
+    } finally {
+      setIsConnectingGithub(false);
     }
   }
 
@@ -1471,11 +1911,232 @@ export default function App() {
                 <Card>
                   <CardHeader>
                     <CardTitle>GitHub</CardTitle>
-                    <CardDescription>PR status, commits, and code review.</CardDescription>
+                    <CardDescription>Connect your GitHub account, then attach workspace repos.</CardDescription>
                   </CardHeader>
-                  <CardContent>
-                    <Button size="sm" variant="outline">
-                      Connect repo
+                  <CardContent className="space-y-3">
+                    <div className="rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground">
+                      <div className="flex items-center justify-between gap-3">
+                        <span>GitHub account</span>
+                        <span>
+                          {isLoadingGithub
+                            ? "Loading..."
+                            : workspaceGithub?.connected
+                              ? `@${workspaceGithub.user?.login ?? "connected"}`
+                              : workspaceGithub?.authConfigured
+                                ? "Not connected"
+                                : "OAuth not configured"}
+                        </span>
+                      </div>
+                    </div>
+                    {!isLoadingGithub && workspaceGithub && !workspaceGithub.authConfigured ? (
+                      <div className="rounded-lg border border-dashed border-border px-3 py-2 text-xs text-muted-foreground">
+                        Add `githubClientId` to `hawkcode.config.json` and restart the server to enable GitHub sign-in.
+                      </div>
+                    ) : null}
+                    {workspaceGithub?.connected && workspaceGithub.user ? (
+                      <div className="rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground">
+                        <div className="font-medium text-foreground">
+                          {workspaceGithub.user.name ?? workspaceGithub.user.login}
+                        </div>
+                        <div className="mt-1">@{workspaceGithub.user.login}</div>
+                        {workspaceGithub.user.scope ? (
+                          <div className="mt-1">Scopes: {workspaceGithub.user.scope}</div>
+                        ) : null}
+                      </div>
+                    ) : null}
+                    {githubAuth.userCode ? (
+                      <div className="rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground">
+                        <div className="font-medium text-foreground">Device code</div>
+                        <div className="mt-1 font-mono text-sm tracking-[0.2em]">{githubAuth.userCode}</div>
+                        {githubAuth.statusText ? <div className="mt-2">{githubAuth.statusText}</div> : null}
+                        {githubAuth.expiresAt ? (
+                          <div className="mt-1">
+                            Expires {new Date(githubAuth.expiresAt).toLocaleTimeString([], {
+                              hour: "numeric",
+                              minute: "2-digit"
+                            })}
+                          </div>
+                        ) : null}
+                        {githubAuth.verificationUri ? (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="mt-2"
+                            onClick={() => void window.hawkcode.openExternalUrl(githubAuth.verificationUri!)}
+                          >
+                            Open GitHub verification page
+                          </Button>
+                        ) : null}
+                      </div>
+                    ) : null}
+                    {githubAuth.error ? (
+                      <div className="text-xs text-destructive">{githubAuth.error}</div>
+                    ) : null}
+                    {workspaceGithub?.authConfigured ? (
+                      <div className="flex gap-2">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="flex-1 justify-center"
+                          onClick={handleStartGitHubAuth}
+                          disabled={githubAuth.inProgress}
+                        >
+                          {githubAuth.inProgress
+                            ? "Waiting for GitHub..."
+                            : workspaceGithub.connected
+                              ? "Reconnect GitHub"
+                              : "Connect GitHub"}
+                        </Button>
+                        {workspaceGithub.connected ? (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="flex-1 justify-center"
+                            onClick={handleDisconnectGitHub}
+                            disabled={githubAuth.inProgress}
+                          >
+                            Disconnect
+                          </Button>
+                        ) : null}
+                      </div>
+                    ) : null}
+                    {isLoadingGithub ? (
+                      <div className="rounded-lg border border-dashed border-border px-3 py-2 text-xs text-muted-foreground">
+                        Loading connected repos...
+                      </div>
+                    ) : workspaceGithub?.repos.length ? (
+                      <div className="space-y-2">
+                        {workspaceGithub.repos.map((repo) => (
+                          <div
+                            key={repo.id}
+                            className="rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground"
+                          >
+                            <div className="flex items-center justify-between gap-3">
+                              <span className="font-medium text-foreground">{repo.repoName}</span>
+                              <span>{repo.projectName}</span>
+                            </div>
+                            <button
+                              type="button"
+                              className="mt-1 block truncate text-left text-primary underline underline-offset-4"
+                              onClick={() => void window.hawkcode.openExternalUrl(repo.repoUrl)}
+                            >
+                              {repo.repoUrl}
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="rounded-lg border border-dashed border-border px-3 py-2 text-xs text-muted-foreground">
+                        No GitHub repos connected for this workspace yet.
+                      </div>
+                    )}
+                    {githubError ? (
+                      <div className="text-xs text-destructive">{githubError}</div>
+                    ) : null}
+                    {workspaceGithub?.canManage ? (
+                      <div className="space-y-2">
+                        <input
+                          value={githubRepoUrl}
+                          onChange={(event) => setGithubRepoUrl(event.target.value)}
+                          placeholder="https://github.com/owner/repo"
+                          className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none transition focus:border-foreground/30"
+                        />
+                        <input
+                          value={githubProjectName}
+                          onChange={(event) => setGithubProjectName(event.target.value)}
+                          placeholder="Project name (optional)"
+                          className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none transition focus:border-foreground/30"
+                        />
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="w-full justify-center"
+                          onClick={handleConnectGithub}
+                          disabled={
+                            isConnectingGithub ||
+                            !githubRepoUrl.trim() ||
+                            !workspaceGithub.connected ||
+                            githubAuth.inProgress
+                          }
+                        >
+                          {isConnectingGithub ? "Connecting..." : "Connect repo"}
+                        </Button>
+                      </div>
+                    ) : workspaceGithub && !isLoadingGithub ? (
+                      <div className="rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground">
+                        Viewer access only. Ask an owner or maintainer to connect a repo.
+                      </div>
+                    ) : null}
+                  </CardContent>
+                </Card>
+                <Card>
+                  <CardHeader>
+                    <CardTitle>Git</CardTitle>
+                    <CardDescription>Local repo state for the workspace checkout on this machine.</CardDescription>
+                  </CardHeader>
+                  <CardContent className="space-y-3">
+                    {isLoadingGit ? (
+                      <div className="rounded-lg border border-dashed border-border px-3 py-2 text-xs text-muted-foreground">
+                        Loading Git status...
+                      </div>
+                    ) : workspaceGit?.repos.length ? (
+                      <div className="space-y-2">
+                        {workspaceGit.repos.map((repo) => (
+                          <div
+                            key={repo.id}
+                            className="rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground"
+                          >
+                            <div className="flex items-center justify-between gap-3">
+                              <span className="font-medium text-foreground">{repo.repoName}</span>
+                              <span>{repo.local ? "Local checkout matched" : "Remote only"}</span>
+                            </div>
+                            <button
+                              type="button"
+                              className="mt-1 block truncate text-left text-primary underline underline-offset-4"
+                              onClick={() => void window.hawkcode.openExternalUrl(repo.repoUrl)}
+                            >
+                              {repo.repoUrl}
+                            </button>
+                            {repo.local ? (
+                              <div className="mt-2 space-y-1">
+                                <div>
+                                  Branch `{repo.local.branch}` · {repo.local.clean ? "Clean" : "Dirty"}
+                                  {repo.local.ahead || repo.local.behind
+                                    ? ` · ahead ${repo.local.ahead} / behind ${repo.local.behind}`
+                                    : ""}
+                                </div>
+                                <div>
+                                  {repo.local.changedFiles} changed · {repo.local.stagedFiles} staged ·{" "}
+                                  {repo.local.modifiedFiles} modified · {repo.local.untrackedFiles} untracked
+                                </div>
+                                <div className="truncate">Path: {repo.local.path}</div>
+                                <div>
+                                  Last commit {repo.local.lastCommit.shortSha} · {repo.local.lastCommit.subject}
+                                </div>
+                              </div>
+                            ) : null}
+                          </div>
+                        ))}
+                      </div>
+                    ) : (
+                      <div className="rounded-lg border border-dashed border-border px-3 py-2 text-xs text-muted-foreground">
+                        No Git repos connected for this workspace yet.
+                      </div>
+                    )}
+                    {workspaceGit && !workspaceGit.detected ? (
+                      <div className="rounded-lg border border-dashed border-border px-3 py-2 text-xs text-muted-foreground">
+                        No local Git checkout detected from the running server workspace.
+                      </div>
+                    ) : null}
+                    {gitError ? <div className="text-xs text-destructive">{gitError}</div> : null}
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      className="w-full justify-center"
+                      onClick={() => selectedWorkspace?.id && void loadWorkspaceGit(selectedWorkspace.id)}
+                      disabled={isLoadingGit || !selectedWorkspace?.id}
+                    >
+                      {isLoadingGit ? "Refreshing..." : "Refresh Git status"}
                     </Button>
                   </CardContent>
                 </Card>

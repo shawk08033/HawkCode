@@ -5,6 +5,12 @@ import { Prisma } from "@prisma/client";
 import { prisma } from "../lib/prisma.js";
 import { loadRuntimeConfig } from "../lib/runtime-config.js";
 import { getSessionUser } from "../lib/auth-session.js";
+import {
+  fetchGitHubUser,
+  isGitHubAuthConfigured,
+  pollGitHubDeviceFlow,
+  startGitHubDeviceFlow
+} from "../lib/github.js";
 
 type LoginBody = {
   email: string;
@@ -21,6 +27,10 @@ type CreateInviteBody = {
   email?: string;
   role: "maintainer" | "viewer";
   expiresInDays?: number;
+};
+
+type GitHubDevicePollBody = {
+  deviceCode: string;
 };
 
 const SESSION_TTL_DAYS = 30;
@@ -45,6 +55,28 @@ function getExpiry() {
   const expires = new Date();
   expires.setDate(expires.getDate() + SESSION_TTL_DAYS);
   return expires;
+}
+
+function buildGitHubAccountRecord(account?: {
+  login: string;
+  name: string | null;
+  email: string | null;
+  avatarUrl: string | null;
+  scope: string | null;
+  createdAt: Date;
+} | null) {
+  if (!account) {
+    return null;
+  }
+
+  return {
+    login: account.login,
+    name: account.name,
+    email: account.email,
+    avatarUrl: account.avatarUrl,
+    scope: account.scope,
+    connectedAt: account.createdAt.toISOString()
+  };
 }
 
 export async function registerAuthRoutes(server: FastifyInstance) {
@@ -262,6 +294,185 @@ export async function registerAuthRoutes(server: FastifyInstance) {
       return reply.code(401).send({ error: "session_expired" });
     }
     return reply.send({ user: { id: session.user.id, email: session.user.email } });
+  });
+
+  server.get("/auth/github/status", async (request, reply) => {
+    const user = await getSessionUser(request.cookies.hawkcode_session);
+    if (!user) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+
+    return reply.send({
+      github: {
+        authConfigured: isGitHubAuthConfigured(),
+        connected: Boolean(user.githubAccount),
+        user: buildGitHubAccountRecord(user.githubAccount)
+      }
+    });
+  });
+
+  server.post("/auth/github/device/start", async (request, reply) => {
+    const user = await getSessionUser(request.cookies.hawkcode_session);
+    if (!user) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+
+    try {
+      const result = await startGitHubDeviceFlow();
+      request.log.info(
+        {
+          userId: user.id,
+          githubDeviceFlow: {
+            action: "start",
+            interval: result.interval,
+            expiresIn: result.expiresIn
+          }
+        },
+        "GitHub device flow started"
+      );
+      const expiresAt = new Date(Date.now() + result.expiresIn * 1000);
+      return reply.send({
+        deviceCode: result.deviceCode,
+        userCode: result.userCode,
+        verificationUri: result.verificationUri,
+        intervalSeconds: result.interval,
+        expiresAt: expiresAt.toISOString()
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "github_device_flow_start_failed";
+      return reply.code(message === "github_not_configured" ? 503 : 502).send({
+        error: message
+      });
+    }
+  });
+
+  server.post<{ Body: GitHubDevicePollBody }>("/auth/github/device/poll", async (request, reply) => {
+    const user = await getSessionUser(request.cookies.hawkcode_session);
+    if (!user) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+
+    const deviceCode = request.body?.deviceCode?.trim();
+    if (!deviceCode) {
+      return reply.code(400).send({ error: "invalid_request" });
+    }
+
+    try {
+      const result = await pollGitHubDeviceFlow(deviceCode);
+      request.log.info(
+        {
+          userId: user.id,
+          githubDeviceFlow: {
+            action: "poll",
+            status: result.status,
+            error: "error" in result ? result.error : undefined
+          }
+        },
+        "GitHub device flow poll result"
+      );
+      if (result.status === "authorization_pending" || result.status === "slow_down") {
+        return reply.send({
+          status: result.status === "slow_down" ? "slow_down" : "pending",
+          message: result.message,
+          intervalSeconds: result.retryAfterSeconds
+        });
+      }
+
+      if (result.status === "error") {
+        return reply.code(
+          result.error === "expired_token" || result.error === "access_denied" ? 400 : 502
+        ).send({
+          status: "error",
+          error: result.error,
+          message: result.message
+        });
+      }
+
+      if (result.status !== "connected") {
+        return reply.code(502).send({
+          status: "error",
+          error: "github_device_flow_poll_failed"
+        });
+      }
+
+      const githubUser = await fetchGitHubUser(result.accessToken);
+      request.log.info(
+        {
+          userId: user.id,
+          githubDeviceFlow: {
+            action: "connected",
+            githubLogin: githubUser.login
+          }
+        },
+        "GitHub device flow connected"
+      );
+      const account = await prisma.gitHubAccount.upsert({
+        where: {
+          userId: user.id
+        },
+        update: {
+          githubUserId: githubUser.githubUserId,
+          login: githubUser.login,
+          name: githubUser.name,
+          email: githubUser.email,
+          avatarUrl: githubUser.avatarUrl,
+          accessToken: result.accessToken,
+          scope: result.scope,
+          tokenType: result.tokenType
+        },
+        create: {
+          userId: user.id,
+          githubUserId: githubUser.githubUserId,
+          login: githubUser.login,
+          name: githubUser.name,
+          email: githubUser.email,
+          avatarUrl: githubUser.avatarUrl,
+          accessToken: result.accessToken,
+          scope: result.scope,
+          tokenType: result.tokenType
+        }
+      });
+
+      return reply.send({
+        status: "connected",
+        github: {
+          authConfigured: isGitHubAuthConfigured(),
+          connected: true,
+          user: buildGitHubAccountRecord(account)
+        }
+      });
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "github_device_flow_poll_failed";
+      request.log.error(
+        {
+          userId: user.id,
+          githubDeviceFlow: {
+            action: "poll_failed",
+            message
+          }
+        },
+        "GitHub device flow poll failed"
+      );
+      return reply.code(message === "github_not_configured" ? 503 : 502).send({
+        status: "error",
+        error: message
+      });
+    }
+  });
+
+  server.delete("/auth/github", async (request, reply) => {
+    const user = await getSessionUser(request.cookies.hawkcode_session);
+    if (!user) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+
+    await prisma.gitHubAccount.deleteMany({
+      where: {
+        userId: user.id
+      }
+    });
+
+    return reply.send({ ok: true });
   });
 
   server.post("/auth/logout", async (request, reply) => {

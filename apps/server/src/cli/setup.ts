@@ -55,6 +55,7 @@ async function promptForConfig(nonInteractive: boolean) {
       dbProvider: (getEnvValue("DATABASE_PROVIDER") ?? "postgresql"),
       databaseUrl: cleanValue(getEnvValue("DATABASE_URL")),
       redisUrl: cleanValue(getEnvValue("REDIS_URL")),
+      githubClientId: cleanValue(getEnvValue("GITHUB_CLIENT_ID")),
       githubAppId: cleanValue(getEnvValue("GITHUB_APP_ID")),
       githubAppKeyPath: cleanValue(getEnvValue("GITHUB_APP_KEY_PATH")),
       codexPath: undefined,
@@ -107,6 +108,12 @@ async function promptForConfig(nonInteractive: boolean) {
       name: "redisUrl",
       message: "Redis URL (optional)",
       initial: getEnvValue("REDIS_URL") ?? ""
+    },
+    {
+      type: "text",
+      name: "githubClientId",
+      message: "GitHub OAuth client ID (optional)",
+      initial: getEnvValue("GITHUB_CLIENT_ID") ?? ""
     },
     {
       type: "text",
@@ -177,6 +184,7 @@ async function promptForConfig(nonInteractive: boolean) {
     workspaceName: cleanValue(response.workspaceName),
     databaseUrl: cleanValue(response.databaseUrl),
     redisUrl: cleanValue(response.redisUrl),
+    githubClientId: cleanValue(response.githubClientId),
     githubAppId: cleanValue(response.githubAppId),
     githubAppKeyPath: cleanValue(response.githubAppKeyPath),
     codexPath: cleanValue(response.codexPath),
@@ -278,6 +286,9 @@ function writeConfigFile(config: {
   dbProvider: string;
   databaseUrl: string;
   redisUrl?: string;
+  githubClientId?: string;
+  githubAppId?: string;
+  githubAppKeyPath?: string;
   codexPath?: string;
   codexModel?: string;
   openrouterApiKey?: string;
@@ -293,6 +304,9 @@ function writeConfigFile(config: {
     dbProvider: config.dbProvider,
     databaseUrl: config.databaseUrl,
     ...(config.redisUrl ? { redisUrl: config.redisUrl } : {}),
+    ...(config.githubClientId ? { githubClientId: config.githubClientId } : {}),
+    ...(config.githubAppId ? { githubAppId: config.githubAppId } : {}),
+    ...(config.githubAppKeyPath ? { githubAppKeyPath: config.githubAppKeyPath } : {}),
     ...(config.codexPath ? { codexPath: config.codexPath } : {}),
     ...(config.codexModel ? { codexModel: config.codexModel } : {}),
     ...(config.openrouterApiKey ? { openrouterApiKey: config.openrouterApiKey } : {}),
@@ -406,6 +420,9 @@ async function main() {
     dbProvider: config.dbProvider,
     databaseUrl: config.databaseUrl,
     redisUrl: config.redisUrl,
+    githubClientId: config.githubClientId,
+    githubAppId: config.githubAppId,
+    githubAppKeyPath: config.githubAppKeyPath,
     codexPath: config.codexPath,
     codexModel: config.codexModel,
     openrouterApiKey: config.openrouterApiKey,

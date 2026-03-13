@@ -6,6 +6,9 @@ const configSchema = z.object({
   databaseUrl: z.string().min(1),
   dbProvider: z.enum(["postgresql", "sqlite"]),
   redisUrl: z.string().optional(),
+  githubClientId: z.string().optional(),
+  githubAppId: z.string().optional(),
+  githubAppKeyPath: z.string().optional(),
   codexPath: z.string().optional(),
   codexModel: z.string().optional(),
   openrouterApiKey: z.string().optional(),
@@ -32,16 +35,21 @@ const LEGACY_PROVIDER_ENV_VARS = [
 let warnedLegacyProviderEnvVars = false;
 
 export function resolveConfigPath() {
-  const cwd = process.cwd();
-  const direct = path.resolve(cwd, CONFIG_FILENAME);
-  if (fs.existsSync(direct)) {
-    return direct;
+  let current = process.cwd();
+  let lastFound: string | null = null;
+
+  while (true) {
+    const candidate = path.resolve(current, CONFIG_FILENAME);
+    if (fs.existsSync(candidate)) {
+      lastFound = candidate;
+    }
+
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return lastFound ?? path.resolve(process.cwd(), CONFIG_FILENAME);
+    }
+    current = parent;
   }
-  const parent = path.resolve(cwd, "..", CONFIG_FILENAME);
-  if (fs.existsSync(parent)) {
-    return parent;
-  }
-  return parent;
 }
 
 export function loadRuntimeConfig(): RuntimeConfig | null {
@@ -59,6 +67,7 @@ export function loadRuntimeConfig(): RuntimeConfig | null {
   };
   return {
     ...config,
+    githubAppKeyPath: resolveMaybe(config.githubAppKeyPath),
     tlsCertPath: resolveMaybe(config.tlsCertPath),
     tlsKeyPath: resolveMaybe(config.tlsKeyPath)
   };
