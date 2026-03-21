@@ -8,7 +8,8 @@ export async function getSessionUser(token?: string) {
     include: {
       user: {
         include: {
-          memberships: true
+          memberships: true,
+          githubAccount: true
         }
       }
     }

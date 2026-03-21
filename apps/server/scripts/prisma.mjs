@@ -5,16 +5,21 @@ import { spawnSync } from "node:child_process";
 const CONFIG_FILENAME = "hawkcode.config.json";
 
 function resolveConfigPath() {
-  const cwd = process.cwd();
-  const direct = path.resolve(cwd, CONFIG_FILENAME);
-  if (fs.existsSync(direct)) {
-    return direct;
+  let current = process.cwd();
+  let lastFound = null;
+
+  while (true) {
+    const candidate = path.resolve(current, CONFIG_FILENAME);
+    if (fs.existsSync(candidate)) {
+      lastFound = candidate;
+    }
+
+    const parent = path.dirname(current);
+    if (parent === current) {
+      return lastFound ?? path.resolve(process.cwd(), CONFIG_FILENAME);
+    }
+    current = parent;
   }
-  const parent = path.resolve(cwd, "..", CONFIG_FILENAME);
-  if (fs.existsSync(parent)) {
-    return parent;
-  }
-  return parent;
 }
 
 function main() {

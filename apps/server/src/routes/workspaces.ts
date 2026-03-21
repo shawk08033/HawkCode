@@ -2,11 +2,145 @@ import { FastifyInstance } from "fastify";
 import { z } from "zod";
 import { prisma } from "../lib/prisma.js";
 import { getSessionUser } from "../lib/auth-session.js";
+import { fetchGitHubRepo, isGitHubAuthConfigured } from "../lib/github.js";
+import { getLocalGitSnapshot, normalizeGitRepoUrl } from "../lib/git.js";
 
 const createSessionBodySchema = z.object({
   workspaceId: z.string().min(1).optional(),
   title: z.string().min(1).max(120).optional()
 });
+
+const connectGithubRepoBodySchema = z.object({
+  repoUrl: z.string().min(1).max(300),
+  projectName: z.string().min(1).max(80).optional()
+});
+
+function normalizeOptional(value?: string | null) {
+  const trimmed = value?.trim();
+  return trimmed ? trimmed : undefined;
+}
+
+function parseGithubRepoUrl(raw: string) {
+  const trimmed = raw.trim();
+
+  const sshMatch = trimmed.match(
+    /^(?:ssh:\/\/)?git@github\.com[:/](?<owner>[^/]+)\/(?<repo>[^/]+?)(?:\.git)?\/?$/i
+  );
+  if (sshMatch?.groups?.owner && sshMatch.groups.repo) {
+    return {
+      owner: sshMatch.groups.owner,
+      repo: sshMatch.groups.repo,
+      canonicalUrl: `https://github.com/${sshMatch.groups.owner}/${sshMatch.groups.repo}`
+    };
+  }
+
+  try {
+    const url = new URL(trimmed);
+    if (url.hostname !== "github.com") {
+      return null;
+    }
+
+    const parts = url.pathname
+      .replace(/^\/+|\/+$/g, "")
+      .replace(/\.git$/i, "")
+      .split("/");
+    if (parts.length < 2 || !parts[0] || !parts[1]) {
+      return null;
+    }
+
+    return {
+      owner: parts[0],
+      repo: parts[1],
+      canonicalUrl: `https://github.com/${parts[0]}/${parts[1]}`
+    };
+  } catch {
+    return null;
+  }
+}
+
+function buildGitPanelRepoRecord(
+  repo: {
+    id: string;
+    provider: string;
+    repoUrl: string;
+    createdAt: Date;
+    project: {
+      id: string;
+      name: string;
+      githubInstallId: string | null;
+    };
+  },
+  localRepo: Awaited<ReturnType<typeof getLocalGitSnapshot>>
+) {
+  const gitHubRecord = buildGithubRepoRecord(repo);
+  const localMatch =
+    localRepo && normalizeGitRepoUrl(repo.repoUrl) === normalizeGitRepoUrl(localRepo.originUrl)
+      ? {
+          path: localRepo.path,
+          branch: localRepo.branch,
+          clean: localRepo.clean,
+          changedFiles: localRepo.changedFiles,
+          stagedFiles: localRepo.stagedFiles,
+          modifiedFiles: localRepo.modifiedFiles,
+          deletedFiles: localRepo.deletedFiles,
+          untrackedFiles: localRepo.untrackedFiles,
+          ahead: localRepo.ahead,
+          behind: localRepo.behind,
+          lastCommit: localRepo.lastCommit
+        }
+      : null;
+
+  return {
+    ...gitHubRecord,
+    local: localMatch
+  };
+}
+
+function buildGithubRepoRecord(repo: {
+  id: string;
+  provider: string;
+  repoUrl: string;
+  createdAt: Date;
+  project: {
+    id: string;
+    name: string;
+    githubInstallId: string | null;
+  };
+}) {
+  const parsed = parseGithubRepoUrl(repo.repoUrl);
+  return {
+    id: repo.id,
+    provider: repo.provider,
+    repoUrl: repo.repoUrl,
+    repoName: parsed ? `${parsed.owner}/${parsed.repo}` : repo.repoUrl,
+    projectId: repo.project.id,
+    projectName: repo.project.name,
+    githubInstallId: repo.project.githubInstallId,
+    connectedAt: repo.createdAt.toISOString()
+  };
+}
+
+function buildGitHubUserRecord(account?: {
+  login: string;
+  name: string | null;
+  email: string | null;
+  avatarUrl: string | null;
+  scope: string | null;
+  createdAt: Date;
+} | null) {
+  if (!account) {
+    return null;
+  }
+
+  return {
+    login: account.login,
+    name: account.name,
+    email: account.email,
+    avatarUrl: account.avatarUrl,
+    scope: account.scope,
+    connectedAt: account.createdAt.toISOString()
+  };
+}
 
 function formatRelativeTime(value: Date) {
   const diffMs = Date.now() - value.getTime();
@@ -164,6 +298,241 @@ export async function registerWorkspaceRoutes(server: FastifyInstance) {
           }))
         )
       }))
+    });
+  });
+
+  server.get("/workspaces/:workspaceId/github", async (request, reply) => {
+    const user = await getSessionUser(request.cookies.hawkcode_session);
+    if (!user) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+
+    const workspaceId = (request.params as { workspaceId: string }).workspaceId;
+    const membership = user.memberships.find(
+      (candidate: (typeof user.memberships)[number]) => candidate.workspaceId === workspaceId
+    );
+    if (!membership) {
+      return reply.code(403).send({ error: "forbidden" });
+    }
+
+    const repos = await prisma.gitRepo.findMany({
+      where: {
+        provider: "github",
+        project: {
+          workspaceId
+        }
+      },
+      orderBy: {
+        createdAt: "asc"
+      },
+      include: {
+        project: {
+          select: {
+            id: true,
+            name: true,
+            githubInstallId: true
+          }
+        }
+      }
+    });
+
+    return reply.send({
+      github: {
+        authConfigured: isGitHubAuthConfigured(),
+        connected: Boolean(user.githubAccount),
+        user: buildGitHubUserRecord(user.githubAccount),
+        canManage: membership.role === "owner" || membership.role === "maintainer",
+        repos: repos.map(buildGithubRepoRecord)
+      }
+    });
+  });
+
+  server.get("/workspaces/:workspaceId/git", async (request, reply) => {
+    const user = await getSessionUser(request.cookies.hawkcode_session);
+    if (!user) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+
+    const workspaceId = (request.params as { workspaceId: string }).workspaceId;
+    const membership = user.memberships.find(
+      (candidate: (typeof user.memberships)[number]) => candidate.workspaceId === workspaceId
+    );
+    if (!membership) {
+      return reply.code(403).send({ error: "forbidden" });
+    }
+
+    const repos = await prisma.gitRepo.findMany({
+      where: {
+        project: {
+          workspaceId
+        }
+      },
+      orderBy: {
+        createdAt: "asc"
+      },
+      include: {
+        project: {
+          select: {
+            id: true,
+            name: true,
+            githubInstallId: true
+          }
+        }
+      }
+    });
+
+    const localRepo = await getLocalGitSnapshot();
+
+    return reply.send({
+      git: {
+        detected: Boolean(localRepo),
+        localRepoUrl: localRepo?.originUrl ?? null,
+        localPath: localRepo?.path ?? null,
+        repos: repos.map((repo) => buildGitPanelRepoRecord(repo, localRepo))
+      }
+    });
+  });
+
+  server.post("/workspaces/:workspaceId/github/connect", async (request, reply) => {
+    const user = await getSessionUser(request.cookies.hawkcode_session);
+    if (!user) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+
+    const workspaceId = (request.params as { workspaceId: string }).workspaceId;
+    const membership = user.memberships.find(
+      (candidate: (typeof user.memberships)[number]) => candidate.workspaceId === workspaceId
+    );
+    if (!membership) {
+      return reply.code(403).send({ error: "forbidden" });
+    }
+    if (membership.role !== "owner" && membership.role !== "maintainer") {
+      return reply.code(403).send({ error: "forbidden" });
+    }
+
+    if (!user.githubAccount?.accessToken) {
+      return reply.code(400).send({
+        error: "github_not_connected",
+        message: "Connect your GitHub account first."
+      });
+    }
+
+    const parsed = connectGithubRepoBodySchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({
+        error: "invalid_request",
+        details: parsed.error.flatten()
+      });
+    }
+
+    const parsedRepo = parseGithubRepoUrl(parsed.data.repoUrl);
+    if (!parsedRepo) {
+      return reply.code(400).send({
+        error: "invalid_github_repo",
+        message: "Use a GitHub repository URL or SSH remote."
+      });
+    }
+
+    const repoUrl = parsedRepo.canonicalUrl;
+    let repoDetails: Awaited<ReturnType<typeof fetchGitHubRepo>>;
+    try {
+      repoDetails = await fetchGitHubRepo(
+        user.githubAccount.accessToken,
+        parsedRepo.owner,
+        parsedRepo.repo
+      );
+    } catch (error) {
+      const message = error instanceof Error ? error.message : "github_repo_not_found";
+      if (message === "github_token_invalid") {
+        await prisma.gitHubAccount.deleteMany({
+          where: {
+            userId: user.id
+          }
+        });
+        return reply.code(401).send({
+          error: "github_reauth_required",
+          message: "Your GitHub session expired. Reconnect your GitHub account."
+        });
+      }
+
+      return reply.code(404).send({
+        error: "github_repo_not_found",
+        message: "Could not access that GitHub repository with your account."
+      });
+    }
+    const projectName = normalizeOptional(parsed.data.projectName) ?? repoDetails.name;
+
+    const repo = await prisma.$transaction(async (tx) => {
+      const existingRepo = await tx.gitRepo.findFirst({
+        where: {
+          provider: "github",
+          repoUrl,
+          project: {
+            workspaceId
+          }
+        },
+        include: {
+          project: {
+            select: {
+              id: true,
+              name: true,
+              githubInstallId: true
+            }
+          }
+        }
+      });
+
+      if (existingRepo) {
+        const updatedProject = await tx.project.update({
+          where: {
+            id: existingRepo.project.id
+          },
+          data: {
+            name: projectName,
+            repoUrl
+          },
+          select: {
+            id: true,
+            name: true,
+            githubInstallId: true
+          }
+        });
+
+        return {
+          ...existingRepo,
+          project: updatedProject
+        };
+      }
+
+      const project = await tx.project.create({
+        data: {
+          workspaceId,
+          name: projectName,
+          repoUrl
+        },
+        select: {
+          id: true,
+          name: true,
+          githubInstallId: true
+        }
+      });
+
+      const gitRepo = await tx.gitRepo.create({
+        data: {
+          projectId: project.id,
+          provider: "github",
+          repoUrl
+        }
+      });
+
+      return {
+        ...gitRepo,
+        project
+      };
+    });
+
+    return reply.send({
+      repo: buildGithubRepoRecord(repo)
     });
   });
 
