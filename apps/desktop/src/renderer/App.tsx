@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useDeferredValue, useEffect, useMemo, useRef, useState } from "react";
 import { Button } from "./components/ui/button.js";
 import { Badge } from "./components/ui/badge.js";
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "./components/ui/card.js";
@@ -286,6 +286,33 @@ function createInitialWorkspaces(): WorkspaceRecord[] {
 
 function isPlaceholderWorkspaceId(workspaceId?: string | null) {
   return Boolean(workspaceId && /^ws-\d+$/.test(workspaceId));
+}
+
+function summarizeMessage(content: string, fallback = "No messages yet.") {
+  const summary = content
+    .replace(/```[\s\S]*?```/g, "[code]")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!summary) {
+    return fallback;
+  }
+
+  return summary.length > 120 ? `${summary.slice(0, 117)}...` : summary;
+}
+
+function getSessionPreview(session: SessionRecord) {
+  const lastMessage = session.messages[session.messages.length - 1];
+  if (!lastMessage) {
+    return "No messages yet.";
+  }
+
+  const speaker = lastMessage.role === "user" ? "You" : "Assistant";
+  return `${speaker}: ${summarizeMessage(lastMessage.content, "")}`;
+}
+
+function getMessageCountLabel(count: number) {
+  return `${count} ${count === 1 ? "message" : "messages"}`;
 }
 
 function preferProvider(providers: ProviderInfo[]) {
@@ -608,9 +635,14 @@ export default function App() {
   const [gitError, setGitError] = useState<string | null>(null);
   const [githubRepoUrl, setGithubRepoUrl] = useState("");
   const [githubProjectName, setGithubProjectName] = useState("");
+  const [sessionQuery, setSessionQuery] = useState("");
   const [githubAuth, setGithubAuth] = useState<GitHubAuthState>({
     inProgress: false
   });
+  const [isNearLatest, setIsNearLatest] = useState(true);
+  const deferredSessionQuery = useDeferredValue(sessionQuery);
+  const chatScrollRef = useRef<HTMLDivElement | null>(null);
+  const draftTextareaRef = useRef<HTMLTextAreaElement | null>(null);
 
   const allSessions = useMemo(
     () => workspaceTree.flatMap((workspace) => workspace.sessions),
@@ -631,6 +663,45 @@ export default function App() {
     () => mergeProviders(serverProviders, codexAuth),
     [serverProviders, codexAuth]
   );
+  const filteredWorkspaces = useMemo(() => {
+    const query = deferredSessionQuery.trim().toLowerCase();
+    if (!query) {
+      return workspaceTree;
+    }
+
+    return workspaceTree
+      .map((workspace) => {
+        const workspaceMatch = workspace.name.toLowerCase().includes(query);
+        const sessions = workspace.sessions.filter((session) => {
+          const haystack = [
+            session.title,
+            session.branch,
+            session.model,
+            session.status,
+            ...session.messages.map((message) => message.content)
+          ]
+            .join(" ")
+            .toLowerCase();
+
+          return haystack.includes(query);
+        });
+
+        const schedules = workspaceMatch
+          ? workspace.schedules
+          : workspace.schedules.filter((schedule) => schedule.title.toLowerCase().includes(query));
+
+        if (workspaceMatch) {
+          return workspace;
+        }
+
+        return {
+          ...workspace,
+          sessions,
+          schedules
+        };
+      })
+      .filter((workspace) => workspace.sessions.length > 0 || workspace.schedules.length > 0);
+  }, [deferredSessionQuery, workspaceTree]);
   const activeProvider =
     availableProviders.find((provider) => provider.name === selectedProvider) ??
     preferProvider(availableProviders);
@@ -721,6 +792,63 @@ export default function App() {
     setDraft("");
     setSendError(null);
   }, [selectedSessionId]);
+
+  useEffect(() => {
+    const textarea = draftTextareaRef.current;
+    if (!textarea) {
+      return;
+    }
+
+    textarea.style.height = "0px";
+    textarea.style.height = `${Math.min(textarea.scrollHeight, 240)}px`;
+  }, [draft]);
+
+  useEffect(() => {
+    const scroller = chatScrollRef.current;
+    if (!scroller) {
+      return;
+    }
+
+    scroller.scrollTop = scroller.scrollHeight;
+    setIsNearLatest(true);
+  }, [selectedSessionId]);
+
+  useEffect(() => {
+    const scroller = chatScrollRef.current;
+    if (!scroller || !selectedSession) {
+      return;
+    }
+
+    if (isNearLatest) {
+      scroller.scrollTo({
+        top: scroller.scrollHeight,
+        behavior: isSending ? "smooth" : "auto"
+      });
+    }
+  }, [isNearLatest, isSending, selectedSession?.messages.length]);
+
+  function handleChatScroll() {
+    const scroller = chatScrollRef.current;
+    if (!scroller) {
+      return;
+    }
+
+    const distanceFromBottom = scroller.scrollHeight - scroller.scrollTop - scroller.clientHeight;
+    setIsNearLatest(distanceFromBottom < 72);
+  }
+
+  function scrollChatToLatest() {
+    const scroller = chatScrollRef.current;
+    if (!scroller) {
+      return;
+    }
+
+    scroller.scrollTo({
+      top: scroller.scrollHeight,
+      behavior: "smooth"
+    });
+    setIsNearLatest(true);
+  }
 
   useEffect(() => {
     if (availableProviders.length === 0) {
@@ -1514,21 +1642,39 @@ export default function App() {
     <div className="h-full overflow-hidden bg-background text-foreground">
       <div className="grid h-full min-h-0 grid-cols-[240px_minmax(0,1fr)_300px] overflow-hidden">
         <aside className="flex min-h-0 flex-col overflow-hidden border-r border-border bg-card px-3 py-3">
-          <div className="space-y-1">
-            <div className="text-sm font-semibold">HawkCode</div>
-            <div className="text-[11px] text-muted-foreground">{authUser}</div>
+          <div className="space-y-3">
+            <div className="space-y-1">
+              <div className="text-sm font-semibold">HawkCode</div>
+              <div className="text-[11px] text-muted-foreground">{authUser}</div>
+            </div>
+            <div className="rounded-2xl border border-border/70 bg-background/70 p-3">
+              <div className="flex items-center justify-between gap-2">
+                <div>
+                  <div className="text-[10px] uppercase tracking-[0.2em] text-muted-foreground">
+                    Sessions
+                  </div>
+                  <div className="mt-1 text-xs text-muted-foreground">
+                    {allSessions.length} across {workspaceTree.length} workspaces
+                  </div>
+                </div>
+                <Button size="sm" variant="ghost" onClick={handleCreateSession}>
+                  New
+                </Button>
+              </div>
+              <input
+                value={sessionQuery}
+                onChange={(event) => setSessionQuery(event.target.value)}
+                placeholder="Search sessions, branches, messages..."
+                className="mt-3 h-10 w-full rounded-xl border border-border bg-transparent px-3 text-sm text-foreground outline-none placeholder:text-muted-foreground focus-visible:ring-2 focus-visible:ring-ring"
+              />
+            </div>
           </div>
           <Separator className="my-3" />
           <div className="min-h-0 flex-1 space-y-3 overflow-y-auto pr-1">
-            <div className="flex items-center justify-between">
-              <div className="text-[10px] uppercase tracking-[0.2em] text-muted-foreground">
-                Workspaces
-              </div>
-              <Button size="sm" variant="ghost">
-                New
-              </Button>
+            <div className="text-[10px] uppercase tracking-[0.2em] text-muted-foreground">
+              Workspaces
             </div>
-            {workspaceTree.map((workspace) => (
+            {filteredWorkspaces.map((workspace) => (
               <div key={workspace.id} className="space-y-2">
                 <button
                   type="button"
@@ -1553,9 +1699,9 @@ export default function App() {
                           key={session.id}
                           type="button"
                           onClick={() => setSelectedSessionId(session.id)}
-                          className={`w-full rounded-xl border px-3 py-2 text-left transition-colors ${
+                          className={`w-full rounded-2xl border px-3 py-3 text-left transition-colors ${
                             selectedSessionId === session.id
-                              ? "border-primary bg-primary/10"
+                              ? "border-primary bg-primary/10 shadow-[0_0_0_1px_rgba(74,222,128,0.18)]"
                               : "border-border bg-background/40 hover:bg-accent"
                           }`}
                         >
@@ -1565,8 +1711,20 @@ export default function App() {
                               {session.status}
                             </span>
                           </div>
-                          <div className="mt-1 text-[11px] text-muted-foreground">
-                            {session.updated} • {session.model}
+                          <div className="mt-2 line-clamp-2 text-[11px] leading-5 text-muted-foreground">
+                            {getSessionPreview(session)}
+                          </div>
+                          <div className="mt-2 flex items-center justify-between gap-2 text-[10px] uppercase tracking-[0.14em] text-muted-foreground">
+                            <span>{session.updated}</span>
+                            <span>{session.model}</span>
+                          </div>
+                          <div className="mt-2 flex flex-wrap gap-2 text-[10px] text-muted-foreground">
+                            <span className="rounded-full border border-border/70 px-2 py-0.5">
+                              {session.branch}
+                            </span>
+                            <span className="rounded-full border border-border/70 px-2 py-0.5">
+                              {getMessageCountLabel(session.messages.length)}
+                            </span>
                           </div>
                         </button>
                       ))}
@@ -1588,6 +1746,11 @@ export default function App() {
                 ) : null}
               </div>
             ))}
+            {filteredWorkspaces.length === 0 ? (
+              <div className="rounded-2xl border border-dashed border-border px-3 py-4 text-sm text-muted-foreground">
+                No sessions match “{sessionQuery.trim()}”.
+              </div>
+            ) : null}
           </div>
           <div className="mt-4 pt-3">
             <Button size="sm" variant="outline" onClick={handleLogout}>
@@ -1596,7 +1759,7 @@ export default function App() {
           </div>
         </aside>
 
-        <main className="flex min-h-0 flex-col overflow-hidden">
+        <main className="relative flex min-h-0 flex-col overflow-hidden">
           <div className="border-b border-border px-6 py-4">
             <div className="flex items-start justify-between gap-4">
               <div className="space-y-2">
@@ -1629,6 +1792,32 @@ export default function App() {
               </div>
             </div>
             {selectedSession ? (
+              <div className="mt-4 grid gap-3 lg:grid-cols-[minmax(0,1fr)_220px]">
+                <div className="rounded-2xl border border-border/70 bg-card/70 px-4 py-3">
+                  <div className="text-[10px] uppercase tracking-[0.2em] text-muted-foreground">
+                    Conversation pulse
+                  </div>
+                  <div className="mt-2 text-sm text-foreground">
+                    {getSessionPreview(selectedSession)}
+                  </div>
+                </div>
+                <div className="grid grid-cols-2 gap-2 text-xs text-muted-foreground">
+                  <div className="rounded-2xl border border-border/70 bg-card/50 px-3 py-3">
+                    <div className="text-[10px] uppercase tracking-[0.16em]">Messages</div>
+                    <div className="mt-1 text-lg font-semibold text-foreground">
+                      {selectedSession.messages.length}
+                    </div>
+                  </div>
+                  <div className="rounded-2xl border border-border/70 bg-card/50 px-3 py-3">
+                    <div className="text-[10px] uppercase tracking-[0.16em]">Context</div>
+                    <div className="mt-1 text-lg font-semibold text-foreground">
+                      {selectedSession.contextCount}
+                    </div>
+                  </div>
+                </div>
+              </div>
+            ) : null}
+            {selectedSession ? (
               <div className="mt-3 flex flex-wrap gap-2">
                 <div className="rounded-full border border-border px-3 py-1 text-xs text-muted-foreground">
                   Provider {activeProvider?.label ?? "Unavailable"}
@@ -1646,7 +1835,11 @@ export default function App() {
             ) : null}
           </div>
 
-          <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-6 py-5">
+          <div
+            ref={chatScrollRef}
+            onScroll={handleChatScroll}
+            className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-6 py-5"
+          >
             {selectedSession ? (
               <div className="mx-auto flex max-w-4xl flex-col gap-4 pb-8">
                 {selectedSession.messages.map((message) => (
@@ -1697,6 +1890,17 @@ export default function App() {
               </div>
             )}
           </div>
+          {selectedSession && !isNearLatest ? (
+            <div className="pointer-events-none absolute inset-x-0 bottom-36 flex justify-center px-6">
+              <button
+                type="button"
+                onClick={scrollChatToLatest}
+                className="pointer-events-auto rounded-full border border-border bg-card/90 px-4 py-2 text-xs font-medium text-foreground shadow-lg backdrop-blur"
+              >
+                Jump to latest
+              </button>
+            </div>
+          ) : null}
           {selectedSession ? (
             <div className="bg-gradient-to-t from-background via-background/95 to-background/0 px-6 pb-5 pt-4">
               <div className="mx-auto max-w-4xl space-y-3">
@@ -1725,6 +1929,7 @@ export default function App() {
                 </div>
                 <div className="rounded-[28px] border border-border/60 bg-card/70 px-4 py-3 shadow-[0_8px_30px_rgba(0,0,0,0.18)] backdrop-blur-sm">
                   <textarea
+                    ref={draftTextareaRef}
                     value={draft}
                     onChange={(event) => setDraft(event.target.value)}
                     onKeyDown={(event) => {
@@ -1736,13 +1941,16 @@ export default function App() {
                       }
                     }}
                     placeholder="Message HawkCode about this session..."
-                    className="min-h-28 w-full resize-none bg-transparent text-sm leading-6 text-foreground outline-none placeholder:text-muted-foreground"
+                    className="max-h-60 min-h-28 w-full resize-none bg-transparent text-sm leading-6 text-foreground outline-none placeholder:text-muted-foreground"
                   />
                   <div className="mt-3 flex items-center justify-between gap-3">
-                    <div className="text-xs text-muted-foreground">
-                      {availableProviders.length > 0
-                        ? `Using ${activeProvider?.label ?? "agent"}${selectedModel ? ` · ${selectedModel}` : ""} for this reply.`
-                        : "No agent providers available yet."}
+                    <div className="space-y-1 text-xs text-muted-foreground">
+                      <div>
+                        {availableProviders.length > 0
+                          ? `Using ${activeProvider?.label ?? "agent"}${selectedModel ? ` · ${selectedModel}` : ""} for this reply.`
+                          : "No agent providers available yet."}
+                      </div>
+                      <div>Enter sends. Shift+Enter adds a new line.</div>
                     </div>
                     <div className="flex items-center gap-2">
                       <select
@@ -1774,6 +1982,14 @@ export default function App() {
                       </select>
                       <Button size="sm" variant="outline">
                         Attach
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="ghost"
+                        disabled={!draft.trim() || isSending}
+                        onClick={() => setDraft("")}
+                      >
+                        Clear
                       </Button>
                       <Button
                         size="sm"
