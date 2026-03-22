@@ -10,8 +10,6 @@ const configSchema = z.object({
   githubClientId: z.string().optional(),
   githubAppId: z.string().optional(),
   githubAppKeyPath: z.string().optional(),
-  codexPath: z.string().optional(),
-  codexModel: z.string().optional(),
   openrouterApiKey: z.string().optional(),
   openrouterBaseUrl: z.string().optional(),
   openrouterModel: z.string().optional(),
@@ -25,8 +23,6 @@ export type RuntimeConfig = z.infer<typeof configSchema>;
 
 const CONFIG_FILENAME = "hawkcode.config.json";
 const LEGACY_PROVIDER_ENV_VARS = [
-  "CODEX_PATH",
-  "CODEX_MODEL",
   "OPENROUTER_API_KEY",
   "OPENROUTER_BASE_URL",
   "OPENROUTER_MODEL",

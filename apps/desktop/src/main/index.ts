@@ -1,10 +1,10 @@
 import { app, BrowserWindow, ipcMain, net, session, shell } from "electron";
 import path from "node:path";
 import fs from "node:fs";
-import { execFile, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn } from "node:child_process";
 import { promises as fsp } from "node:fs";
 import { createRequire } from "node:module";
-import { tmpdir } from "node:os";
+import { homedir, tmpdir, userInfo } from "node:os";
 import { promisify } from "node:util";
 
 const require = createRequire(import.meta.url);
@@ -44,6 +44,7 @@ if (devServerUrl) {
 
 const pendingCerts = new Map<string, PendingCert>();
 const codexCommand = "codex";
+const defaultCursorModel = process.env.HAWKCODE_CURSOR_MODEL?.trim() || "auto";
 let codexAuthState: {
   loggedIn: boolean;
   inProgress: boolean;
@@ -54,6 +55,21 @@ let codexAuthState: {
 } = {
   loggedIn: false,
   inProgress: false
+};
+let cursorCliState: {
+  found: boolean;
+  loggedIn: boolean;
+  inProgress: boolean;
+  command: string | null;
+  authUrl?: string;
+  statusText: string;
+  error?: string;
+} = {
+  found: false,
+  loggedIn: false,
+  inProgress: false,
+  command: null,
+  statusText: "Cursor CLI not found"
 };
 
 function extractFirstUrl(value: string) {
@@ -66,6 +82,112 @@ function extractDeviceCode(value: string) {
 
 function stripAnsi(value: string) {
   return value.replace(/\u001B\[[0-?]*[ -/]*[@-~]/g, "");
+}
+
+function getResolvedCursorCommand() {
+  const explicit = process.env.HAWKCODE_CURSOR_PATH?.trim();
+  const homeCandidates = [
+    process.env.HOME?.trim(),
+    homedir(),
+    (() => {
+      try {
+        return userInfo().homedir;
+      } catch {
+        return undefined;
+      }
+    })(),
+    process.env.USER?.trim() ? path.join("/home", process.env.USER.trim()) : undefined
+  ].filter((value, index, all): value is string => Boolean(value && all.indexOf(value) === index));
+  const candidates = [
+    explicit,
+    "agent",
+    "cursor-agent",
+    ...homeCandidates.flatMap((homeDir) => [
+      path.join(homeDir, ".local/bin/agent"),
+      path.join(homeDir, ".cursor/bin/agent"),
+      path.join(homeDir, ".local/bin/cursor-agent"),
+      path.join(homeDir, ".cursor/bin/cursor-agent")
+    ])
+  ].filter((value): value is string => Boolean(value && value.length > 0));
+
+  for (const candidate of candidates) {
+    if (!candidate.includes("/")) {
+      try {
+        const result = execFileSync("bash", ["-lc", `command -v ${candidate}`], {
+          cwd: process.cwd(),
+          env: process.env,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "ignore"]
+        }).trim();
+        if (result) {
+          return result;
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+function getCursorEnv(command: string) {
+  const commandDir = path.dirname(command);
+  const currentPath = process.env.PATH ?? "";
+  const nextPath = currentPath.split(":").includes(commandDir)
+    ? currentPath
+    : `${commandDir}:${currentPath}`;
+  return {
+    ...process.env,
+    PATH: nextPath
+  };
+}
+
+function buildCliPrompt(providerLabel: string, messages: Array<{ role: string; content: string }>) {
+  return [
+    `You are the ${providerLabel} agent inside HawkCode.`,
+    "Respond to the latest user request using the conversation below as context.",
+    "Return only the assistant reply text.",
+    "Do not modify files, run shell commands, or make tool calls.",
+    "",
+    ...messages.map((message) => `${message.role.toUpperCase()}: ${message.content}`)
+  ].join("\n");
+}
+
+function summarizeForCursor(content: string) {
+  const flattened = content
+    .replace(/```[\s\S]*?```/g, "[code block omitted]")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (flattened.length <= 600) {
+    return flattened;
+  }
+
+  return `${flattened.slice(0, 597)}...`;
+}
+
+function buildCursorPrompt(messages: Array<{ role: string; content: string }>) {
+  const recentMessages = messages.slice(-6);
+  const latestUserMessage = [...recentMessages].reverse().find((message) => message.role === "user");
+  const contextMessages = recentMessages.slice(0, latestUserMessage ? -1 : recentMessages.length);
+
+  return [
+    "You are the Cursor agent inside HawkCode.",
+    "Answer the latest user request.",
+    "Return only the assistant reply text.",
+    "Do not modify files, run shell commands, or make tool calls.",
+    "",
+    "Recent conversation context:",
+    ...contextMessages.map((message) => `${message.role}: ${summarizeForCursor(message.content)}`),
+    "",
+    "Latest user request:",
+    summarizeForCursor(latestUserMessage?.content ?? messages[messages.length - 1]?.content ?? "")
+  ].join("\n");
 }
 
 async function getCodexAuthStatus() {
@@ -164,13 +286,7 @@ async function generateCodexReply(messages: Array<{ role: string; content: strin
     await fsp.mkdtemp(path.join(tmpdir(), "hawkcode-desktop-codex-")),
     "last-message.txt"
   );
-  const prompt = [
-    "You are the Codex agent inside HawkCode.",
-    "Respond to the latest user request using the conversation below as context.",
-    "Return only the assistant reply text.",
-    "",
-    ...messages.map((message) => `${message.role.toUpperCase()}: ${message.content}`)
-  ].join("\n");
+  const prompt = buildCliPrompt("Codex", messages);
 
   try {
     await execFileAsync(codexCommand, [
@@ -201,6 +317,249 @@ async function generateCodexReply(messages: Array<{ role: string; content: strin
     provider: "codex" as const,
     model,
     content
+  };
+}
+
+async function canUseCursor() {
+  const cursorCommand = getResolvedCursorCommand();
+  if (!cursorCommand) {
+    return false;
+  }
+
+  try {
+    await execFileAsync(cursorCommand, ["status"], {
+      cwd: process.cwd(),
+      env: getCursorEnv(cursorCommand)
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+async function getCursorCliStatus() {
+  const cursorCommand = getResolvedCursorCommand();
+  if (!cursorCommand) {
+    cursorCliState = {
+      found: false,
+      loggedIn: false,
+      inProgress: false,
+      command: null,
+      statusText: "Cursor CLI not found"
+    };
+    return cursorCliState;
+  }
+
+  try {
+    const result = await execFileAsync(cursorCommand, ["status"], {
+      cwd: process.cwd(),
+      env: getCursorEnv(cursorCommand)
+    });
+    const output = stripAnsi(`${result.stdout}\n${result.stderr}`).trim();
+    cursorCliState = {
+      found: true,
+      loggedIn: !output.toLowerCase().includes("not logged in"),
+      inProgress: cursorCliState.inProgress,
+      command: cursorCommand,
+      authUrl: cursorCliState.authUrl,
+      statusText: output || "Cursor CLI available",
+      error: undefined
+    };
+    return cursorCliState;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Cursor CLI status check failed.";
+    cursorCliState = {
+      found: true,
+      loggedIn: false,
+      inProgress: cursorCliState.inProgress,
+      command: cursorCommand,
+      authUrl: cursorCliState.authUrl,
+      statusText: message,
+      error: message
+    };
+    return cursorCliState;
+  }
+}
+
+function startCursorCliAuth() {
+  if (cursorCliState.inProgress) {
+    return cursorCliState;
+  }
+
+  const cursorCommand = getResolvedCursorCommand();
+  if (!cursorCommand) {
+    cursorCliState = {
+      found: false,
+      loggedIn: false,
+      inProgress: false,
+      command: null,
+      statusText: "Cursor CLI not found",
+      error: "Install Cursor CLI first."
+    };
+    return cursorCliState;
+  }
+
+  cursorCliState = {
+    found: true,
+    loggedIn: false,
+    inProgress: true,
+    command: cursorCommand,
+    authUrl: undefined,
+    statusText: "Starting Cursor CLI login...",
+    error: undefined
+  };
+
+  const child = spawn(cursorCommand, ["login"], {
+    cwd: process.cwd(),
+    env: getCursorEnv(cursorCommand),
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+
+  const handleChunk = (chunk: Buffer | string) => {
+    const text = stripAnsi(chunk.toString()).trim();
+    if (!text) {
+      return;
+    }
+
+    const authUrl = extractFirstUrl(text);
+    cursorCliState = {
+      ...cursorCliState,
+      statusText: text,
+      authUrl: authUrl ?? cursorCliState.authUrl
+    };
+
+    if (authUrl) {
+      void shell.openExternal(authUrl);
+    }
+  };
+
+  child.stdout.on("data", handleChunk);
+  child.stderr.on("data", handleChunk);
+  child.on("error", (error) => {
+    cursorCliState = {
+      ...cursorCliState,
+      inProgress: false,
+      loggedIn: false,
+      error: error.message,
+      statusText: "Cursor CLI login failed."
+    };
+  });
+  child.on("close", async () => {
+    cursorCliState = {
+      ...cursorCliState,
+      inProgress: false
+    };
+    await getCursorCliStatus();
+  });
+
+  return cursorCliState;
+}
+
+async function generateCursorReply(messages: Array<{ role: string; content: string }>, model = defaultCursorModel) {
+  const cursorCommand = getResolvedCursorCommand();
+  if (!cursorCommand) {
+    throw new Error(
+      "Cursor CLI not found. Install it with `curl https://cursor.com/install -fsS | bash`, or set HAWKCODE_CURSOR_PATH to `agent` or `cursor-agent`."
+    );
+  }
+
+  const prompt = buildCursorPrompt(messages);
+  const args = [
+    "-p",
+    "--output-format",
+    "json",
+    "--trust"
+  ];
+  if (model && model.trim().length > 0 && model !== "auto") {
+    args.push("-m", model);
+  }
+  args.push(prompt);
+
+  let stdout: string;
+  try {
+    const result = await execFileAsync(cursorCommand, args, {
+      cwd: process.cwd(),
+      env: getCursorEnv(cursorCommand)
+    });
+    stdout = result.stdout;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Cursor CLI request failed.";
+    throw new Error(`Cursor CLI request failed: ${message}`);
+  }
+
+  let payload: { type?: string; subtype?: string; is_error?: boolean; result?: string };
+  try {
+    payload = JSON.parse(stdout) as { type?: string; subtype?: string; is_error?: boolean; result?: string };
+  } catch {
+    throw new Error("Cursor CLI returned invalid JSON.");
+  }
+
+  const content =
+    payload.type === "result" && payload.subtype === "success" && !payload.is_error
+      ? payload.result?.trim()
+      : "";
+  if (!content) {
+    throw new Error("Cursor CLI returned an empty response.");
+  }
+
+  return {
+    provider: "cursor" as const,
+    model,
+    content
+  };
+}
+
+async function getDesktopAgentProviders() {
+  const providers: Array<{ name: "codex" | "cursor"; label: string; defaultModel: string }> = [];
+  const codexStatus = await getCodexAuthStatus();
+  if (codexStatus.loggedIn) {
+    providers.push({
+      name: "codex",
+      label: "Codex",
+      defaultModel: "gpt-5"
+    });
+  }
+
+  if (await canUseCursor()) {
+    providers.push({
+      name: "cursor",
+      label: "Cursor CLI",
+      defaultModel: defaultCursorModel
+    });
+  }
+
+  return providers;
+}
+
+async function getDesktopAgentProviderDebug() {
+  const cursorCommand = getResolvedCursorCommand();
+  const codexStatus = await getCodexAuthStatus();
+
+  let cursorStatusOutput = "";
+  let cursorStatusOk = false;
+  if (cursorCommand) {
+    try {
+      const result = await execFileAsync(cursorCommand, ["status"], {
+        cwd: process.cwd(),
+        env: getCursorEnv(cursorCommand)
+      });
+      cursorStatusOk = true;
+      cursorStatusOutput = stripAnsi(`${result.stdout}\n${result.stderr}`).trim();
+    } catch (error) {
+      cursorStatusOutput = error instanceof Error ? error.message : "cursor_status_failed";
+    }
+  }
+
+  return {
+    cwd: process.cwd(),
+    home: process.env.HOME ?? null,
+    path: process.env.PATH ?? "",
+    codexCommand,
+    codexStatus,
+    cursorCommand,
+    cursorStatusOk,
+    cursorStatusOutput,
+    detectedProviders: await getDesktopAgentProviders()
   };
 }
 
@@ -318,17 +677,32 @@ app.whenReady().then(() => {
     return getCodexAuthStatus();
   });
 
+  ipcMain.handle("hawkcode:get-cursor-cli-status", async () => {
+    return getCursorCliStatus();
+  });
+
   ipcMain.handle("hawkcode:start-codex-auth", async () => {
     return startCodexAuth();
   });
+
+  ipcMain.handle("hawkcode:start-cursor-cli-auth", async () => {
+    return startCursorCliAuth();
+  });
+
 
   ipcMain.handle("hawkcode:open-external-url", async (_event, url: string) => {
     await shell.openExternal(url);
     return { ok: true };
   });
 
-  ipcMain.handle("hawkcode:generate-codex-reply", async (_event, payload) => {
-    return generateCodexReply(payload.messages, payload.model);
+  ipcMain.handle("hawkcode:generate-local-agent-reply", async (_event, payload) => {
+    if (payload.provider === "codex") {
+      return generateCodexReply(payload.messages, payload.model);
+    }
+    if (payload.provider === "cursor") {
+      return generateCursorReply(payload.messages, payload.model);
+    }
+    throw new Error(`Unsupported local provider: ${payload.provider as string}`);
   });
 
   createWindow();

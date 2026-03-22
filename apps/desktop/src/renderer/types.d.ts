@@ -21,13 +21,24 @@ type CodexAuthStatus = {
   error?: string;
 };
 
+type CursorCliStatus = {
+  found: boolean;
+  loggedIn: boolean;
+  inProgress: boolean;
+  command: string | null;
+  authUrl?: string;
+  statusText: string;
+  error?: string;
+};
+
 type CodexGeneratePayload = {
+  provider: "codex" | "cursor";
   messages: Array<{ role: string; content: string }>;
   model?: string;
 };
 
 type CodexGenerateResult = {
-  provider: "codex";
+  provider: "codex" | "cursor";
   model: string;
   content: string;
 };
@@ -42,9 +53,11 @@ declare global {
       getPendingCert: (hostname: string) => Promise<PendingCert | null>;
       trustCert: (hostname: string) => Promise<{ ok: boolean }>;
       getCodexAuthStatus: () => Promise<CodexAuthStatus>;
+      getCursorCliStatus: () => Promise<CursorCliStatus>;
       startCodexAuth: () => Promise<CodexAuthStatus>;
+      startCursorCliAuth: () => Promise<CursorCliStatus>;
       openExternalUrl: (url: string) => Promise<{ ok: boolean }>;
-      generateCodexReply: (payload: CodexGeneratePayload) => Promise<CodexGenerateResult>;
+      generateLocalAgentReply: (payload: CodexGeneratePayload) => Promise<CodexGenerateResult>;
     };
   }
 }

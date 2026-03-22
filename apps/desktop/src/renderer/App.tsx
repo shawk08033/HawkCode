@@ -12,14 +12,14 @@ type Status = {
 };
 
 type ProviderInfo = {
-  name: "codex" | "openrouter";
+  name: "codex" | "cursor" | "openrouter";
   label: string;
   defaultModel: string;
 };
 
 type ChatMessage = {
   id: string;
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "system";
   content: string;
   timestamp: string;
 };
@@ -90,7 +90,7 @@ type WorkspaceGithubState = {
 type AgentReplyResponse = {
   sessionId: string;
   agentRunId: string;
-  provider: "codex" | "openrouter";
+  provider: "codex" | "cursor" | "openrouter";
   model: string;
   message: {
     id: string;
@@ -106,6 +106,16 @@ type CodexAuthStatus = {
   authUrl?: string;
   code?: string;
   statusText?: string;
+  error?: string;
+};
+
+type CursorCliStatus = {
+  found: boolean;
+  loggedIn: boolean;
+  inProgress: boolean;
+  command: string | null;
+  authUrl?: string;
+  statusText: string;
   error?: string;
 };
 
@@ -403,7 +413,8 @@ function getSessionPreview(session: SessionRecord) {
     return "No messages yet.";
   }
 
-  const speaker = lastMessage.role === "user" ? "You" : "Assistant";
+  const speaker =
+    lastMessage.role === "user" ? "You" : lastMessage.role === "system" ? "Note" : "Assistant";
   return `${speaker}: ${summarizeMessage(lastMessage.content, "")}`;
 }
 
@@ -415,25 +426,34 @@ function preferProvider(providers: ProviderInfo[]) {
   return providers.find((provider) => provider.name === "codex") ?? providers[0] ?? null;
 }
 
-function mergeProviders(serverProviders: ProviderInfo[], codexAuth: CodexAuthStatus) {
-  if (!codexAuth.loggedIn) {
-    return serverProviders;
+function mergeProviders(serverProviders: ProviderInfo[], localProviders: ProviderInfo[]) {
+  const merged = [...localProviders];
+  for (const provider of serverProviders) {
+    if (!merged.some((entry) => entry.name === provider.name)) {
+      merged.push(provider);
+    }
   }
-
-  const hasCodex = serverProviders.some((provider) => provider.name === "codex");
-  if (hasCodex) {
-    return serverProviders;
-  }
-
-  return [
-    {
-      name: "codex",
-      label: "Codex",
-      defaultModel: "gpt-5"
-    } satisfies ProviderInfo,
-    ...serverProviders
-  ];
+  return merged;
 }
+
+function formatProviderRunLabel(provider: ProviderInfo, model: string) {
+  return `${provider.label} · ${model}`;
+}
+
+function buildModelSwitchNote(nextRunLabel: string) {
+  return `Model changed to ${nextRunLabel}.`;
+}
+
+function getModelSwitchNote(session: SessionRecord, provider: ProviderInfo, model: string) {
+  const nextRunLabel = formatProviderRunLabel(provider, model);
+  return session.model === nextRunLabel ? null : buildModelSwitchNote(nextRunLabel);
+}
+
+const CURSOR_SETUP_PROVIDER: ProviderInfo = {
+  name: "cursor",
+  label: "Cursor CLI (setup required)",
+  defaultModel: "auto"
+};
 
 function getModelOptions(provider?: ProviderInfo | null) {
   if (!provider) {
@@ -442,6 +462,12 @@ function getModelOptions(provider?: ProviderInfo | null) {
 
   if (provider.name === "codex") {
     return ["gpt-5", "gpt-5-codex", "gpt-5-mini"];
+  }
+
+  if (provider.name === "cursor") {
+    return [provider.defaultModel, "auto", "claude-4.6-opus-high-thinking", "gpt-5.4-medium", "gpt-5-mini"].filter(
+      (value, index, all) => all.indexOf(value) === index
+    );
   }
 
   return [
@@ -712,15 +738,23 @@ export default function App() {
     "ws-2": false
   });
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
-  const [selectedProvider, setSelectedProvider] = useState<"codex" | "openrouter" | null>(null);
+  const [selectedProvider, setSelectedProvider] = useState<"codex" | "cursor" | "openrouter" | null>(null);
   const [selectedModel, setSelectedModel] = useState("");
   const [isSending, setIsSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
   const [copiedCodeId, setCopiedCodeId] = useState<string | null>(null);
   const [serverProviders, setServerProviders] = useState<ProviderInfo[]>([]);
+  const [localProviders, setLocalProviders] = useState<ProviderInfo[]>([]);
   const [codexAuth, setCodexAuth] = useState<CodexAuthStatus>({
     loggedIn: false,
     inProgress: false
+  });
+  const [cursorCli, setCursorCli] = useState<CursorCliStatus>({
+    found: false,
+    loggedIn: false,
+    inProgress: false,
+    command: null,
+    statusText: "Cursor CLI not found"
   });
   const [workspaceGithub, setWorkspaceGithub] = useState<WorkspaceGithubState | null>(null);
   const [workspaceGit, setWorkspaceGit] = useState<WorkspaceGitState | null>(null);
@@ -777,8 +811,8 @@ export default function App() {
     [selectedSessionId, workspaceTree]
   );
   const availableProviders = useMemo(
-    () => mergeProviders(serverProviders, codexAuth),
-    [serverProviders, codexAuth]
+    () => mergeProviders(serverProviders, localProviders),
+    [serverProviders, localProviders]
   );
   const filteredAvailableGithubRepos = useMemo(() => {
     const query = githubRepoQuery.trim().toLowerCase();
@@ -840,6 +874,15 @@ export default function App() {
   const activeProvider =
     availableProviders.find((provider) => provider.name === selectedProvider) ??
     preferProvider(availableProviders);
+  const providerOptions = useMemo(() => {
+    if (cursorCli.found) {
+      return availableProviders;
+    }
+    return [...availableProviders, CURSOR_SETUP_PROVIDER];
+  }, [availableProviders, cursorCli.found]);
+  const cursorAvailable = availableProviders.some((provider) => provider.name === "cursor");
+  const cursorSetupSelected = selectedProvider === "cursor" && !cursorCli.found;
+  const cursorLoginRequired = selectedProvider === "cursor" && cursorCli.found && !cursorCli.loggedIn;
   const availableModels = useMemo(() => getModelOptions(activeProvider), [activeProvider]);
   const selectedProjectRepo =
     syncedRepos.find((repo) => repo.projectId === selectedSession?.projectId) ?? null;
@@ -854,6 +897,78 @@ export default function App() {
 
     return (activeEditorTab.isEditing ? activeEditorTab.draftContent : activeEditorTab.content).split("\n");
   }, [activeEditorTab]);
+
+  async function refreshAvailableProviders() {
+    const [codexResult, cursorResult] = await Promise.allSettled([
+      window.hawkcode.getCodexAuthStatus(),
+      window.hawkcode.getCursorCliStatus()
+    ]);
+
+    const nextCodexAuth =
+      codexResult.status === "fulfilled"
+        ? codexResult.value
+        : {
+            loggedIn: false,
+            inProgress: false,
+            statusText: "Not connected",
+            error: "Could not check Codex login state."
+          } satisfies CodexAuthStatus;
+    const nextCursorCli =
+      cursorResult.status === "fulfilled"
+        ? cursorResult.value
+        : {
+            found: false,
+            loggedIn: false,
+            inProgress: false,
+            command: null,
+            statusText: "Could not check Cursor CLI state.",
+            error: "Could not check Cursor CLI state."
+          } satisfies CursorCliStatus;
+
+    setCodexAuth(nextCodexAuth);
+    setCursorCli(nextCursorCli);
+
+    const nextLocalProviders: ProviderInfo[] = [
+      ...(nextCodexAuth.loggedIn
+        ? [{
+            name: "codex",
+            label: "Codex",
+            defaultModel: "gpt-5"
+          } satisfies ProviderInfo]
+        : []),
+      ...(nextCursorCli.found
+          ? [{
+              name: "cursor",
+              label: nextCursorCli.loggedIn ? "Cursor CLI" : "Cursor CLI (login required)",
+              defaultModel: "auto"
+            } satisfies ProviderInfo]
+          : [])
+    ];
+    setLocalProviders(nextLocalProviders);
+
+    let nextProviders: ProviderInfo[] = [];
+    if (authUser) {
+      try {
+        const response = await fetch(`${serverUrl.replace(/\/$/, "")}/agent/providers`, {
+          method: "GET",
+          credentials: "include"
+        });
+        nextProviders = response.ok
+          ? (((await response.json()) as { providers?: ProviderInfo[] }).providers ?? [])
+          : [];
+      } catch {
+        nextProviders = [];
+      }
+    }
+    setServerProviders(nextProviders);
+    setSelectedProvider((current) => {
+      const merged = mergeProviders(nextProviders, nextLocalProviders);
+      if (current && (current === "cursor" || merged.some((provider) => provider.name === current))) {
+        return current;
+      }
+      return preferProvider(merged)?.name ?? null;
+    });
+  }
 
   async function loadSessionGit(sessionId: string) {
     setSessionGitError(null);
@@ -1178,17 +1293,17 @@ export default function App() {
   }
 
   useEffect(() => {
-    if (availableProviders.length === 0) {
+    if (providerOptions.length === 0) {
       if (selectedProvider !== null) {
         setSelectedProvider(null);
       }
       return;
     }
 
-    if (!selectedProvider || !availableProviders.some((provider) => provider.name === selectedProvider)) {
+    if (!selectedProvider || !providerOptions.some((provider) => provider.name === selectedProvider)) {
       setSelectedProvider(preferProvider(availableProviders)?.name ?? null);
     }
-  }, [availableProviders, selectedProvider]);
+  }, [availableProviders, providerOptions, selectedProvider]);
 
   useEffect(() => {
     if (!activeProvider) {
@@ -1227,40 +1342,10 @@ export default function App() {
   }, [serverConfigLoaded, serverUrl]);
 
   useEffect(() => {
-    if (!serverConfigLoaded || !authUser) {
-      setServerProviders([]);
-      setSelectedProvider(null);
+    if (!serverConfigLoaded) {
       return;
     }
-
-    async function loadProviders() {
-      try {
-        const response = await fetch(`${serverUrl.replace(/\/$/, "")}/agent/providers`, {
-          method: "GET",
-          credentials: "include"
-        });
-        if (!response.ok) {
-          setServerProviders([]);
-          setSelectedProvider(null);
-          return;
-        }
-        const data = (await response.json()) as { providers?: ProviderInfo[] };
-        const nextProviders = data.providers ?? [];
-        setServerProviders(nextProviders);
-        setSelectedProvider((current) => {
-          const merged = mergeProviders(nextProviders, codexAuth);
-          if (current && merged.some((provider) => provider.name === current)) {
-            return current;
-          }
-          return preferProvider(merged)?.name ?? null;
-        });
-      } catch {
-        setServerProviders([]);
-        setSelectedProvider(null);
-      }
-    }
-
-    void loadProviders();
+    void refreshAvailableProviders();
   }, [authUser, codexAuth.loggedIn, serverConfigLoaded, serverUrl]);
 
   useEffect(() => {
@@ -1300,6 +1385,20 @@ export default function App() {
       window.clearInterval(interval);
     };
   }, [codexAuth.inProgress]);
+
+  useEffect(() => {
+    if (!cursorCli.inProgress) {
+      return;
+    }
+
+    const interval = window.setInterval(() => {
+      void window.hawkcode.getCursorCliStatus().then(setCursorCli).catch(() => undefined);
+    }, 2000);
+
+    return () => {
+      window.clearInterval(interval);
+    };
+  }, [cursorCli.inProgress]);
 
   useEffect(() => {
     if (!serverConfigLoaded || !authUser) {
@@ -1864,7 +1963,10 @@ export default function App() {
           return {
             ...session,
             serverSessionId: response.sessionId,
-            model: activeProvider?.label ?? session.model,
+            model:
+              activeProvider && response.model
+                ? formatProviderRunLabel(activeProvider, response.model)
+                : session.model,
             updated: "Just now",
             status: "Live",
             messages: nextMessages
@@ -1905,6 +2007,35 @@ export default function App() {
     return optimisticId;
   }
 
+  function appendSessionNote(localSessionId: string, note: string) {
+    const noteId = `system-note-${Date.now()}`;
+
+    setWorkspaceTree((current) =>
+      current.map((workspace) => ({
+        ...workspace,
+        sessions: workspace.sessions.map((session) => {
+          if (session.id !== localSessionId) {
+            return session;
+          }
+
+          return {
+            ...session,
+            updated: "Just now",
+            messages: [
+              ...session.messages,
+              {
+                id: noteId,
+                role: "system",
+                content: note,
+                timestamp: formatTimestamp()
+              }
+            ]
+          };
+        })
+      }))
+    );
+  }
+
   function removeOptimisticMessage(localSessionId: string, optimisticId: string) {
     setWorkspaceTree((current) =>
       current.map((workspace) => ({
@@ -1938,17 +2069,28 @@ export default function App() {
     }
 
     const prompt = draft.trim();
+    const nextModel =
+      selectedModel && availableModels.includes(selectedModel)
+        ? selectedModel
+        : activeProvider.defaultModel;
+    const modelSwitchNote = getModelSwitchNote(selectedSession, activeProvider, nextModel);
+    if (modelSwitchNote) {
+      appendSessionNote(selectedSession.id, modelSwitchNote);
+    }
     const optimisticId = appendOptimisticUserMessage(selectedSession.id, prompt);
     setIsSending(true);
     setSendError(null);
     setDraft("");
 
     try {
-      if (activeProvider.name === "codex") {
-        const localResult = await window.hawkcode.generateCodexReply({
-          model: selectedModel || activeProvider.defaultModel,
+      if (activeProvider.name === "codex" || activeProvider.name === "cursor") {
+        const localResult = await window.hawkcode.generateLocalAgentReply({
+          provider: activeProvider.name,
+          model: nextModel,
           messages: [
-            ...selectedSession.messages.map((message) => ({
+            ...selectedSession.messages
+              .filter((message) => message.role !== "system")
+              .map((message) => ({
               role: message.role,
               content: message.content
             })),
@@ -1991,7 +2133,7 @@ export default function App() {
         credentials: "include",
         body: JSON.stringify({
           provider: activeProvider.name,
-          model: selectedModel || activeProvider.defaultModel,
+          model: nextModel,
           sessionId: selectedSession.serverSessionId,
           message: prompt
         })
@@ -2583,17 +2725,31 @@ export default function App() {
                     {selectedSession.messages.map((message) => (
                       <div
                         key={message.id}
-                        className={`flex ${message.role === "user" ? "justify-end" : "justify-start"}`}
+                        className={`flex ${
+                          message.role === "system"
+                            ? "justify-center"
+                            : message.role === "user"
+                              ? "justify-end"
+                              : "justify-start"
+                        }`}
                       >
                         <div
                           className={`max-w-3xl rounded-3xl px-4 py-3 ${
-                            message.role === "user"
+                            message.role === "system"
+                              ? "border border-dashed border-border bg-background text-muted-foreground"
+                              : message.role === "user"
                               ? "bg-primary text-primary-foreground"
                               : "border border-border bg-card"
                           }`}
                         >
                           <div className="mb-2 flex items-center gap-2 text-[11px] uppercase tracking-[0.18em] opacity-70">
-                            <span>{message.role === "user" ? "You" : "Assistant"}</span>
+                            <span>
+                              {message.role === "system"
+                                ? "Session note"
+                                : message.role === "user"
+                                  ? "You"
+                                  : "Assistant"}
+                            </span>
                             <span>{message.timestamp}</span>
                           </div>
                           <div className="space-y-3">
@@ -2974,8 +3130,12 @@ export default function App() {
                   <div className="mt-3 flex items-center justify-between gap-3">
                     <div className="space-y-1 text-xs text-muted-foreground">
                       <div>
-                        {availableProviders.length > 0
+                        {activeProvider
                           ? `Using ${activeProvider?.label ?? "agent"}${selectedModel ? ` · ${selectedModel}` : ""} for this reply.`
+                          : cursorSetupSelected
+                            ? "Cursor CLI is selected but not installed yet."
+                          : cursorLoginRequired
+                            ? "Cursor CLI is installed, but login is required."
                           : "No agent providers available yet."}
                       </div>
                       <div>Enter sends. Shift+Enter adds a new line.</div>
@@ -2984,13 +3144,13 @@ export default function App() {
                       <select
                         value={selectedProvider ?? ""}
                         onChange={(event) =>
-                          setSelectedProvider(event.target.value as "codex" | "openrouter")
+                          setSelectedProvider(event.target.value as "codex" | "cursor" | "openrouter")
                         }
                         className="h-9 rounded-md border border-border bg-background px-3 text-sm"
-                        disabled={availableProviders.length === 0 || isSending}
+                        disabled={providerOptions.length === 0 || isSending}
                       >
-                        {availableProviders.length === 0 ? <option value="">No providers</option> : null}
-                        {availableProviders.map((provider) => (
+                        {providerOptions.length === 0 ? <option value="">No providers</option> : null}
+                        {providerOptions.map((provider) => (
                           <option key={provider.name} value={provider.name}>
                             {provider.label}
                           </option>
@@ -3000,7 +3160,7 @@ export default function App() {
                         value={selectedModel}
                         onChange={(event) => setSelectedModel(event.target.value)}
                         className="h-9 w-44 rounded-md border border-border bg-background px-3 text-sm"
-                        disabled={!activeProvider || isSending}
+                        disabled={!activeProvider || isSending || cursorSetupSelected || cursorLoginRequired}
                       >
                         {availableModels.map((model) => (
                           <option key={model} value={model}>
@@ -3021,13 +3181,94 @@ export default function App() {
                       </Button>
                       <Button
                         size="sm"
-                        disabled={!selectedSession || !draft.trim() || !activeProvider || isSending}
+                        disabled={
+                          !selectedSession ||
+                          !draft.trim() ||
+                          !activeProvider ||
+                          isSending ||
+                          cursorSetupSelected ||
+                          cursorLoginRequired
+                        }
                         onClick={handleSend}
                       >
                         {isSending ? "Sending..." : "Send"}
                       </Button>
                     </div>
                   </div>
+                  {cursorSetupSelected ? (
+                    <div className="mt-3 rounded-2xl border border-dashed border-border bg-background/80 px-4 py-3 text-xs text-muted-foreground">
+                      <div className="font-medium text-foreground">Cursor CLI setup required</div>
+                      <div className="mt-1">
+                        Install the CLI, then restart HawkCode or reselect the provider.
+                      </div>
+                      <div className="mt-2 font-mono text-[11px] text-foreground">
+                        curl https://cursor.com/install -fsS | bash
+                      </div>
+                      <div className="mt-2">
+                        HawkCode auto-discovers `agent` and `cursor-agent` from `PATH`,
+                        `~/.local/bin`, and `~/.cursor/bin`.
+                      </div>
+                      <div className="mt-3 flex gap-2">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => void refreshAvailableProviders()}
+                        >
+                          Recheck Cursor CLI
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => void window.hawkcode.openExternalUrl("https://cursor.com/docs/cli/using")}
+                        >
+                          Open Cursor CLI docs
+                        </Button>
+                      </div>
+                    </div>
+                  ) : null}
+                  {cursorLoginRequired ? (
+                    <div className="mt-3 rounded-2xl border border-dashed border-border bg-background/80 px-4 py-3 text-xs text-muted-foreground">
+                      <div className="font-medium text-foreground">Cursor CLI login required</div>
+                      <div className="mt-1">
+                        The CLI is installed at `{cursorCli.command ?? "agent"}`, but it is not logged in yet.
+                      </div>
+                      <div className="mt-2 font-mono text-[11px] text-foreground">agent login</div>
+                      <div className="mt-2">{cursorCli.statusText}</div>
+                      <div className="mt-3 flex gap-2">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => void window.hawkcode.startCursorCliAuth().then(setCursorCli)}
+                          disabled={cursorCli.inProgress}
+                        >
+                          {cursorCli.inProgress ? "Waiting for Cursor login..." : "Connect Cursor CLI"}
+                        </Button>
+                        {cursorCli.authUrl ? (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => void window.hawkcode.openExternalUrl(cursorCli.authUrl!)}
+                          >
+                            Open login browser
+                          </Button>
+                        ) : null}
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => void refreshAvailableProviders()}
+                        >
+                          Recheck Cursor CLI
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => void window.hawkcode.openExternalUrl("https://cursor.com/docs/cli/using")}
+                        >
+                          Open Cursor CLI docs
+                        </Button>
+                      </div>
+                    </div>
+                  ) : null}
                   {sendError ? <div className="mt-3 text-xs text-destructive">{sendError}</div> : null}
                 </div>
               </div>

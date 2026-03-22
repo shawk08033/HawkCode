@@ -39,6 +39,13 @@ type OpenRouterPayload = {
   }>;
 };
 
+type CursorPayload = {
+  type?: string;
+  subtype?: string;
+  is_error?: boolean;
+  result?: string;
+};
+
 function requireProviderConfig(
   provider: AgentProvider,
   registry: AgentProviderRegistry
@@ -47,7 +54,7 @@ function requireProviderConfig(
   if (!config) {
     throw new Error(`Provider ${provider} is not configured.`);
   }
-  if (provider !== "codex" && !config.apiKey) {
+  if (provider === "openrouter" && !config.apiKey) {
     throw new Error(`Provider ${provider} is not configured.`);
   }
   return config;
@@ -55,6 +62,17 @@ function requireProviderConfig(
 
 function normalizeBaseUrl(baseUrl: string) {
   return baseUrl.replace(/\/$/, "");
+}
+
+function buildCliPrompt(providerLabel: string, messages: AgentChatMessage[]) {
+  return [
+    `You are the ${providerLabel} agent inside HawkCode.`,
+    "Respond to the latest user request using the conversation below as context.",
+    "Return only the assistant reply text.",
+    "Do not modify files, run shell commands, or make tool calls.",
+    "",
+    ...messages.map((message) => `${message.role.toUpperCase()}: ${message.content}`)
+  ].join("\n");
 }
 
 function extractOpenRouterText(payload: OpenRouterPayload) {
@@ -74,6 +92,14 @@ function extractOpenRouterText(payload: OpenRouterPayload) {
   return "";
 }
 
+function extractCursorText(payload: CursorPayload) {
+  if (payload.type !== "result" || payload.subtype !== "success" || payload.is_error) {
+    return "";
+  }
+
+  return typeof payload.result === "string" ? payload.result.trim() : "";
+}
+
 async function generateCodexReply(
   config: AgentProviderConfig,
   messages: AgentChatMessage[],
@@ -83,13 +109,7 @@ async function generateCodexReply(
     await fs.mkdtemp(path.join(tmpdir(), "hawkcode-codex-")),
     "last-message.txt"
   );
-  const prompt = [
-    "You are the Codex agent inside HawkCode.",
-    "Respond to the latest user request using the conversation below as context.",
-    "Return only the assistant reply text.",
-    "",
-    ...messages.map((message) => `${message.role.toUpperCase()}: ${message.content}`)
-  ].join("\n");
+  const prompt = buildCliPrompt("Codex", messages);
 
   try {
     await execFileAsync(config.command ?? "codex", [
@@ -118,6 +138,54 @@ async function generateCodexReply(
 
   return {
     provider: "codex" as const,
+    model: model ?? config.defaultModel,
+    content
+  };
+}
+
+async function generateCursorReply(
+  config: AgentProviderConfig,
+  messages: AgentChatMessage[],
+  model?: string
+) {
+  const prompt = buildCliPrompt("Cursor", messages);
+
+  let stdout: string;
+  try {
+    const result = await execFileAsync(config.command ?? "cursor-agent", [
+      "-p",
+      "--output-format",
+      "json",
+      "-m",
+      model ?? config.defaultModel,
+      prompt
+    ], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        ...(config.apiKey ? { CURSOR_API_KEY: config.apiKey } : {})
+      }
+    });
+    stdout = result.stdout;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "unknown_error";
+    throw new Error(`Cursor CLI request failed: ${message}`);
+  }
+
+  let payload: CursorPayload;
+  try {
+    payload = JSON.parse(stdout) as CursorPayload;
+  } catch {
+    throw new Error("Cursor CLI returned invalid JSON.");
+  }
+
+  const content = extractCursorText(payload);
+  if (!content) {
+    throw new Error("Cursor CLI returned an empty response.");
+  }
+
+  return {
+    provider: "cursor" as const,
     model: model ?? config.defaultModel,
     content
   };
@@ -174,6 +242,21 @@ export async function canUseCodex(command = "codex") {
   }
 }
 
+export async function canUseCursor(command = "cursor-agent", apiKey?: string) {
+  try {
+    await execFileAsync(command, apiKey ? ["--version"] : ["status"], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        ...(apiKey ? { CURSOR_API_KEY: apiKey } : {})
+      }
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 export async function generateAgentReply(
   options: GenerateAgentReplyOptions
 ): Promise<GenerateAgentReplyResult> {
@@ -181,6 +264,10 @@ export async function generateAgentReply(
 
   if (options.provider === "codex") {
     return generateCodexReply(config, options.messages, options.model);
+  }
+
+  if (options.provider === "cursor") {
+    return generateCursorReply(config, options.messages, options.model);
   }
 
   return generateOpenRouterReply(config, options.messages, options.model);

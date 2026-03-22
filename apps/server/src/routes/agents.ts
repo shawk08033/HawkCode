@@ -1,6 +1,5 @@
 import { FastifyInstance } from "fastify";
 import {
-  canUseCodex,
   generateAgentReply,
   type AgentProviderConfig,
   type AgentProviderRegistry
@@ -17,21 +16,48 @@ import { prisma } from "../lib/prisma.js";
 import { loadRuntimeConfig } from "../lib/runtime-config.js";
 import { getSessionUser } from "../lib/auth-session.js";
 
+const SESSION_NOTE_PREFIX = "[Session note]";
+
 function normalizeOptional(value?: string | null) {
   const trimmed = value?.trim();
   return trimmed ? trimmed : undefined;
 }
 
+function formatProviderLabel(provider: string) {
+  return provider === "codex"
+    ? "Codex"
+    : provider === "cursor"
+      ? "Cursor CLI"
+      : provider === "openrouter"
+        ? "OpenRouter"
+        : "Agent";
+}
+
+function formatRunLabel(provider: string, model: string) {
+  return `${formatProviderLabel(provider)} · ${model}`;
+}
+
+function buildSessionNote(provider: string, model: string) {
+  return `${SESSION_NOTE_PREFIX} Model changed to ${formatRunLabel(provider, model)}.`;
+}
+
+function parseToolCallInput(raw?: string | null) {
+  if (!raw) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(raw) as {
+      provider?: string;
+      model?: string;
+    };
+  } catch {
+    return null;
+  }
+}
+
 async function buildProviderRegistry(): Promise<AgentProviderRegistry> {
   const runtimeConfig = loadRuntimeConfig();
-  const codexCommand = normalizeOptional(runtimeConfig?.codexPath) ?? "codex";
-  const codex = await canUseCodex(codexCommand)
-    ? {
-        command: codexCommand,
-        defaultModel: normalizeOptional(runtimeConfig?.codexModel) ?? "gpt-5"
-      }
-    : undefined;
-
   const openrouterApiKey = runtimeConfig?.openrouterApiKey;
   const openrouter = openrouterApiKey
     ? {
@@ -44,21 +70,12 @@ async function buildProviderRegistry(): Promise<AgentProviderRegistry> {
     : undefined;
 
   return {
-    ...(codex ? { codex } : {}),
     ...(openrouter ? { openrouter } : {})
   };
 }
 
 function getAvailableProviders(registry: AgentProviderRegistry): AgentProviderInfo[] {
   const providers: AgentProviderInfo[] = [];
-
-  if (registry.codex) {
-    providers.push({
-      name: "codex",
-      label: "Codex",
-      defaultModel: registry.codex.defaultModel
-    });
-  }
 
   if (registry.openrouter) {
     providers.push({
@@ -127,6 +144,10 @@ async function getConversationMessages(sessionId: string, systemPrompt?: string)
   }
 
   for (const message of dbMessages) {
+    if (message.role === "system" && message.content.startsWith(SESSION_NOTE_PREFIX)) {
+      continue;
+    }
+
     if (message.role === "user" || message.role === "assistant" || message.role === "system") {
       messages.push({
         role: message.role,
@@ -156,7 +177,7 @@ async function createToolCall(options: {
 }
 
 async function persistAgentReply(options: {
-  provider: "codex" | "openrouter";
+  provider: "codex" | "cursor" | "openrouter";
   model: string;
   sessionId?: string;
   message: string;
@@ -178,6 +199,41 @@ async function persistAgentReply(options: {
     fallbackWorkspaceId: primaryMembership.workspaceId,
     initialMessage: options.message
   });
+
+  const latestRun = await prisma.agentRun.findFirst({
+    where: {
+      sessionId: session.id
+    },
+    orderBy: {
+      createdAt: "desc"
+    },
+    include: {
+      toolCalls: {
+        where: {
+          name: "generate_reply"
+        },
+        orderBy: {
+          id: "desc"
+        },
+        take: 1
+      }
+    }
+  });
+  const previousRun = parseToolCallInput(latestRun?.toolCalls[0]?.input);
+  const providerChanged =
+    previousRun?.provider && previousRun.model
+      ? previousRun.provider !== options.provider || previousRun.model !== options.model
+      : false;
+  if (providerChanged) {
+    await prisma.message.create({
+      data: {
+        sessionId: session.id,
+        authorId: options.userId,
+        role: "system",
+        content: buildSessionNote(options.provider, options.model)
+      }
+    });
+  }
 
   const userMessage = await prisma.message.create({
     data: {

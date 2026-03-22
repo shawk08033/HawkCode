@@ -59,8 +59,6 @@ async function promptForConfig(nonInteractive: boolean) {
       githubClientId: cleanValue(getEnvValue("GITHUB_CLIENT_ID")),
       githubAppId: cleanValue(getEnvValue("GITHUB_APP_ID")),
       githubAppKeyPath: cleanValue(getEnvValue("GITHUB_APP_KEY_PATH")),
-      codexPath: undefined,
-      codexModel: undefined,
       openrouterApiKey: undefined,
       openrouterBaseUrl: undefined,
       openrouterModel: undefined,
@@ -136,18 +134,6 @@ async function promptForConfig(nonInteractive: boolean) {
     },
     {
       type: "text",
-      name: "codexPath",
-      message: "Codex CLI path (optional)",
-      initial: "codex"
-    },
-    {
-      type: "text",
-      name: "codexModel",
-      message: "Codex default model (optional)",
-      initial: "gpt-5"
-    },
-    {
-      type: "text",
       name: "openrouterApiKey",
       message: "OpenRouter API key (optional)",
       initial: ""
@@ -195,8 +181,6 @@ async function promptForConfig(nonInteractive: boolean) {
     githubClientId: cleanValue(response.githubClientId),
     githubAppId: cleanValue(response.githubAppId),
     githubAppKeyPath: cleanValue(response.githubAppKeyPath),
-    codexPath: cleanValue(response.codexPath),
-    codexModel: cleanValue(response.codexModel),
     openrouterApiKey: cleanValue(response.openrouterApiKey),
     openrouterModel: cleanValue(response.openrouterModel),
     openrouterSiteUrl: cleanValue(response.openrouterSiteUrl),
@@ -297,8 +281,6 @@ function writeConfigFile(config: {
   githubClientId?: string;
   githubAppId?: string;
   githubAppKeyPath?: string;
-  codexPath?: string;
-  codexModel?: string;
   openrouterApiKey?: string;
   openrouterBaseUrl?: string;
   openrouterModel?: string;
@@ -315,8 +297,6 @@ function writeConfigFile(config: {
     ...(config.githubClientId ? { githubClientId: config.githubClientId } : {}),
     ...(config.githubAppId ? { githubAppId: config.githubAppId } : {}),
     ...(config.githubAppKeyPath ? { githubAppKeyPath: config.githubAppKeyPath } : {}),
-    ...(config.codexPath ? { codexPath: config.codexPath } : {}),
-    ...(config.codexModel ? { codexModel: config.codexModel } : {}),
     ...(config.openrouterApiKey ? { openrouterApiKey: config.openrouterApiKey } : {}),
     ...(config.openrouterBaseUrl ? { openrouterBaseUrl: config.openrouterBaseUrl } : {}),
     ...(config.openrouterModel ? { openrouterModel: config.openrouterModel } : {}),
@@ -431,8 +411,6 @@ async function main() {
     githubClientId: config.githubClientId,
     githubAppId: config.githubAppId,
     githubAppKeyPath: config.githubAppKeyPath,
-    codexPath: config.codexPath,
-    codexModel: config.codexModel,
     openrouterApiKey: config.openrouterApiKey,
     openrouterBaseUrl: config.openrouterBaseUrl,
     openrouterModel: config.openrouterModel,
