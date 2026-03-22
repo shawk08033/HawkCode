@@ -185,6 +185,39 @@ type SessionFileContext = {
   } | null;
 };
 
+type SessionGitState = {
+  branch: string | null;
+  baseBranch: string | null;
+  repoUrl: string | null;
+  clean: boolean;
+  changedFiles: Array<{
+    path: string;
+    staged: boolean;
+    modified: boolean;
+    untracked: boolean;
+  }>;
+  ahead: number | null;
+  behind: number | null;
+  lastCommit: {
+    sha: string;
+    shortSha: string;
+    subject: string;
+    committedAt: string;
+  } | null;
+  canPush: boolean;
+  canCreatePr: boolean;
+};
+
+type SessionGitResponse = {
+  git?: SessionGitState;
+  pullRequest?: {
+    url: string;
+    number: number;
+    title: string;
+    state: string;
+  };
+};
+
 type GitHubDeviceStartResponse = {
   deviceCode: string;
   userCode: string;
@@ -699,6 +732,15 @@ export default function App() {
   const [githubError, setGithubError] = useState<string | null>(null);
   const [gitError, setGitError] = useState<string | null>(null);
   const [fileError, setFileError] = useState<string | null>(null);
+  const [sessionGit, setSessionGit] = useState<SessionGitState | null>(null);
+  const [sessionGitError, setSessionGitError] = useState<string | null>(null);
+  const [commitMessage, setCommitMessage] = useState("");
+  const [pullRequestTitle, setPullRequestTitle] = useState("");
+  const [pullRequestBody, setPullRequestBody] = useState("");
+  const [pullRequestUrl, setPullRequestUrl] = useState<string | null>(null);
+  const [isCommitting, setIsCommitting] = useState(false);
+  const [isPushing, setIsPushing] = useState(false);
+  const [isCreatingPullRequest, setIsCreatingPullRequest] = useState(false);
   const [githubRepoQuery, setGithubRepoQuery] = useState("");
   const [selectedGithubRepoUrl, setSelectedGithubRepoUrl] = useState("");
   const [githubProjectName, setGithubProjectName] = useState("");
@@ -812,6 +854,26 @@ export default function App() {
 
     return (activeEditorTab.isEditing ? activeEditorTab.draftContent : activeEditorTab.content).split("\n");
   }, [activeEditorTab]);
+
+  async function loadSessionGit(sessionId: string) {
+    setSessionGitError(null);
+
+    try {
+      const response = await fetch(`${serverUrl.replace(/\/$/, "")}/sessions/${sessionId}/git`, {
+        method: "GET",
+        credentials: "include"
+      });
+      if (!response.ok) {
+        throw new Error("Could not load session Git state.");
+      }
+
+      const data = (await response.json()) as SessionGitResponse;
+      setSessionGit(data.git ?? null);
+    } catch (error) {
+      setSessionGit(null);
+      setSessionGitError(error instanceof Error ? error.message : "Could not load session Git state.");
+    }
+  }
 
   async function loadWorkspaceGithub(workspaceId: string) {
     setIsLoadingGithub(true);
@@ -1014,6 +1076,12 @@ export default function App() {
     setOpenEditorTabs([]);
     setActiveCenterTab("chat");
     setActiveEditorView("source");
+    setSessionGit(null);
+    setSessionGitError(null);
+    setPullRequestUrl(null);
+    setCommitMessage("");
+    setPullRequestTitle("");
+    setPullRequestBody("");
   }, [selectedSessionId]);
 
   useEffect(() => {
@@ -1029,6 +1097,16 @@ export default function App() {
     }
 
     void loadSessionFiles(selectedSession.serverSessionId);
+  }, [selectedSession?.serverSessionId, selectedSession?.worktree?.path]);
+
+  useEffect(() => {
+    if (!selectedSession?.serverSessionId) {
+      setSessionGit(null);
+      setSessionGitError(null);
+      return;
+    }
+
+    void loadSessionGit(selectedSession.serverSessionId);
   }, [selectedSession?.serverSessionId, selectedSession?.worktree?.path]);
 
   useEffect(() => {
@@ -1559,6 +1637,7 @@ export default function App() {
             : tab
         )
       );
+      await loadSessionGit(selectedSession.serverSessionId);
     } catch (error) {
       setFileError(error instanceof Error ? error.message : "Could not save file.");
       setOpenEditorTabs((current) =>
@@ -1572,6 +1651,146 @@ export default function App() {
         )
       );
     }
+  }
+
+  async function handleCommitSessionChanges() {
+    if (!selectedSession?.serverSessionId || !commitMessage.trim()) {
+      return;
+    }
+
+    setIsCommitting(true);
+    setSessionGitError(null);
+
+    try {
+      const response = await fetch(`${serverUrl.replace(/\/$/, "")}/sessions/${selectedSession.serverSessionId}/commit`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          message: commitMessage.trim()
+        })
+      });
+      const data = (await response.json().catch(() => null)) as
+        | SessionGitResponse
+        | { error?: string }
+        | null;
+      if (!response.ok) {
+        throw new Error((data as { error?: string } | null)?.error ?? "Could not commit changes.");
+      }
+
+      setSessionGit((data as SessionGitResponse).git ?? null);
+      setCommitMessage("");
+    } catch (error) {
+      setSessionGitError(error instanceof Error ? error.message : "Could not commit changes.");
+    } finally {
+      setIsCommitting(false);
+    }
+  }
+
+  async function handlePushSessionBranch() {
+    if (!selectedSession?.serverSessionId) {
+      return;
+    }
+
+    setIsPushing(true);
+    setSessionGitError(null);
+
+    try {
+      const response = await fetch(`${serverUrl.replace(/\/$/, "")}/sessions/${selectedSession.serverSessionId}/push`, {
+        method: "POST",
+        credentials: "include"
+      });
+      const data = (await response.json().catch(() => null)) as
+        | SessionGitResponse
+        | { error?: string }
+        | null;
+      if (!response.ok) {
+        throw new Error((data as { error?: string } | null)?.error ?? "Could not push branch.");
+      }
+
+      setSessionGit((data as SessionGitResponse).git ?? null);
+    } catch (error) {
+      setSessionGitError(error instanceof Error ? error.message : "Could not push branch.");
+    } finally {
+      setIsPushing(false);
+    }
+  }
+
+  async function handleCreatePullRequest() {
+    if (!selectedSession?.serverSessionId) {
+      return;
+    }
+
+    setIsCreatingPullRequest(true);
+    setSessionGitError(null);
+
+    try {
+      const response = await fetch(
+        `${serverUrl.replace(/\/$/, "")}/sessions/${selectedSession.serverSessionId}/pull-request`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({
+            title: pullRequestTitle.trim() || undefined,
+            body: pullRequestBody.trim() || undefined
+          })
+        }
+      );
+      const data = (await response.json().catch(() => null)) as
+        | SessionGitResponse
+        | { error?: string }
+        | null;
+      if (!response.ok) {
+        throw new Error((data as { error?: string } | null)?.error ?? "Could not create pull request.");
+      }
+
+      const next = data as SessionGitResponse;
+      setSessionGit(next.git ?? null);
+      setPullRequestUrl(next.pullRequest?.url ?? null);
+      if (next.pullRequest?.url) {
+        await window.hawkcode.openExternalUrl(next.pullRequest.url);
+      }
+    } catch (error) {
+      setSessionGitError(error instanceof Error ? error.message : "Could not create pull request.");
+    } finally {
+      setIsCreatingPullRequest(false);
+    }
+  }
+
+  function handleAskAiForSessionGit(kind: "commit" | "pr") {
+    const changedFiles = sessionGit?.changedFiles.map((file) => file.path).slice(0, 50) ?? [];
+    const changedList = changedFiles.length > 0 ? changedFiles.map((path) => `- ${path}`).join("\n") : "- No changed files detected";
+
+    const prompt =
+      kind === "commit"
+        ? [
+            "Write a concise commit message for the current session branch.",
+            `Session: ${selectedSession?.title ?? "Unknown session"}`,
+            `Branch: ${sessionGit?.branch ?? selectedSession?.worktree?.branch ?? "unknown"}`,
+            "Changed files:",
+            changedList,
+            "",
+            "Return only the commit message."
+          ].join("\n")
+        : [
+            "Draft a pull request title and body for the current session branch.",
+            `Session: ${selectedSession?.title ?? "Unknown session"}`,
+            `Head branch: ${sessionGit?.branch ?? selectedSession?.worktree?.branch ?? "unknown"}`,
+            `Base branch: ${sessionGit?.baseBranch ?? "main"}`,
+            "Changed files:",
+            changedList,
+            "",
+            "Format the response as:",
+            "Title: ...",
+            "",
+            "Body:",
+            "..."
+          ].join("\n");
+
+    setDraft(prompt);
+    setActiveCenterTab("chat");
+    draftTextareaRef.current?.focus();
   }
 
   async function handleCreateSession() {
@@ -2312,6 +2531,19 @@ export default function App() {
                   >
                     Chat
                   </button>
+                  {selectedSession?.worktree ? (
+                    <button
+                      type="button"
+                      onClick={() => setActiveCenterTab("session-git")}
+                      className={`rounded-t-xl border px-3 py-2 text-sm transition-colors ${
+                        activeCenterTab === "session-git"
+                          ? "border-border border-b-background bg-background text-foreground"
+                          : "border-transparent bg-card/60 text-muted-foreground hover:bg-accent"
+                      }`}
+                    >
+                      Git
+                    </button>
+                  ) : null}
                   {openEditorTabs.map((tab) => (
                     <div
                       key={tab.path}
@@ -2382,6 +2614,145 @@ export default function App() {
                         </div>
                       </div>
                     ) : null}
+                  </div>
+                </div>
+              ) : activeCenterTab === "session-git" ? (
+                <div className="min-h-0 flex-1 overflow-hidden px-6 py-5">
+                  <div className="mx-auto grid h-full max-w-6xl gap-4 lg:grid-cols-[minmax(0,1.4fr)_360px]">
+                    <div className="min-h-0 overflow-hidden rounded-3xl border border-border bg-card/70">
+                      <div className="flex items-center justify-between gap-3 border-b border-border px-4 py-3">
+                        <div>
+                          <div className="font-medium text-foreground">Session Git Review</div>
+                          <div className="mt-1 text-xs text-muted-foreground">
+                            {sessionGit?.branch ?? selectedSession?.worktree?.branch ?? "No branch"} into {sessionGit?.baseBranch ?? "main"}
+                          </div>
+                        </div>
+                        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+                          <span>{sessionGit?.clean ? "Clean" : `${sessionGit?.changedFiles.length ?? 0} changed`}</span>
+                          {sessionGit && sessionGit.ahead !== null && sessionGit.behind !== null ? (
+                            <span>
+                              ahead {sessionGit.ahead} / behind {sessionGit.behind}
+                            </span>
+                          ) : null}
+                        </div>
+                      </div>
+                      <div className="min-h-0 h-full overflow-y-auto p-4">
+                        {sessionGit?.changedFiles.length ? (
+                          <div className="space-y-2">
+                            {sessionGit.changedFiles.map((file) => (
+                              <div
+                                key={file.path}
+                                className="flex items-center justify-between gap-3 rounded-2xl border border-border bg-background/50 px-4 py-3"
+                              >
+                                <div className="min-w-0">
+                                  <div className="truncate text-sm text-foreground">{file.path}</div>
+                                  <div className="mt-1 text-xs text-muted-foreground">
+                                    {file.untracked ? "New file" : file.staged ? "Staged changes" : "Modified file"}
+                                  </div>
+                                </div>
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  onClick={() =>
+                                    selectedSession?.serverSessionId &&
+                                    void loadSessionFile(selectedSession.serverSessionId, file.path)
+                                  }
+                                >
+                                  Open file
+                                </Button>
+                              </div>
+                            ))}
+                          </div>
+                        ) : (
+                          <div className="rounded-2xl border border-dashed border-border px-4 py-6 text-sm text-muted-foreground">
+                            No changed files in this session worktree yet.
+                          </div>
+                        )}
+                      </div>
+                    </div>
+                    <div className="min-h-0 overflow-y-auto rounded-3xl border border-border bg-card/70 p-4">
+                      <div className="space-y-4">
+                        <div className="rounded-2xl border border-border bg-background/50 px-4 py-3">
+                          <div className="text-sm font-medium text-foreground">Commit</div>
+                          <div className="mt-3 flex gap-2">
+                            <input
+                              value={commitMessage}
+                              onChange={(event) => setCommitMessage(event.target.value)}
+                              placeholder="Commit message"
+                              className="flex-1 rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none transition focus:border-foreground/30"
+                            />
+                            <Button size="sm" variant="outline" onClick={() => handleAskAiForSessionGit("commit")}>
+                              AI Help
+                            </Button>
+                          </div>
+                          <div className="mt-3 flex gap-2">
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="flex-1 justify-center"
+                              onClick={handleCommitSessionChanges}
+                              disabled={isCommitting || !commitMessage.trim()}
+                            >
+                              {isCommitting ? "Committing..." : "Commit"}
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              className="flex-1 justify-center"
+                              onClick={handlePushSessionBranch}
+                              disabled={isPushing || !sessionGit?.canPush}
+                            >
+                              {isPushing ? "Pushing..." : "Push"}
+                            </Button>
+                          </div>
+                        </div>
+
+                        <div className="rounded-2xl border border-border bg-background/50 px-4 py-3">
+                          <div className="text-sm font-medium text-foreground">Pull Request</div>
+                          <div className="mt-3 flex gap-2">
+                            <input
+                              value={pullRequestTitle}
+                              onChange={(event) => setPullRequestTitle(event.target.value)}
+                              placeholder="Pull request title"
+                              className="flex-1 rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none transition focus:border-foreground/30"
+                            />
+                            <Button size="sm" variant="outline" onClick={() => handleAskAiForSessionGit("pr")}>
+                              AI Help
+                            </Button>
+                          </div>
+                          <textarea
+                            value={pullRequestBody}
+                            onChange={(event) => setPullRequestBody(event.target.value)}
+                            placeholder="Pull request body"
+                            className="mt-3 min-h-40 w-full rounded-2xl border border-border bg-background px-3 py-3 text-sm outline-none transition focus:border-foreground/30"
+                          />
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="mt-3 w-full justify-center"
+                            onClick={handleCreatePullRequest}
+                            disabled={isCreatingPullRequest || !sessionGit?.canCreatePr}
+                          >
+                            {isCreatingPullRequest ? "Opening PR..." : "Open pull request"}
+                          </Button>
+                          {pullRequestUrl ? (
+                            <button
+                              type="button"
+                              className="mt-3 block truncate text-left text-primary underline underline-offset-4"
+                              onClick={() => void window.hawkcode.openExternalUrl(pullRequestUrl)}
+                            >
+                              {pullRequestUrl}
+                            </button>
+                          ) : null}
+                        </div>
+
+                        {sessionGitError ? (
+                          <div className="rounded-2xl border border-destructive/40 bg-destructive/10 px-4 py-3 text-sm text-destructive">
+                            {sessionGitError}
+                          </div>
+                        ) : null}
+                      </div>
+                    </div>
                   </div>
                 </div>
               ) : activeEditorTab ? (
@@ -2822,6 +3193,113 @@ export default function App() {
                       <span>Status</span>
                       <span>{selectedSession?.status ?? "Idle"}</span>
                     </div>
+                  </CardContent>
+                </Card>
+                <Card>
+                  <CardHeader>
+                    <div className="flex items-center justify-between gap-2">
+                      <div>
+                        <CardTitle>Session Git</CardTitle>
+                        <CardDescription>Commit, push, and open a pull request for this session branch.</CardDescription>
+                      </div>
+                      {selectedSession?.worktree ? (
+                        <Button size="sm" variant="outline" onClick={() => setActiveCenterTab("session-git")}>
+                          Expand
+                        </Button>
+                      ) : null}
+                    </div>
+                  </CardHeader>
+                  <CardContent className="space-y-3 text-xs text-muted-foreground">
+                    {selectedSession?.worktree ? (
+                      <>
+                        <div className="rounded-lg border border-border px-3 py-2">
+                          <div className="flex items-center justify-between gap-2">
+                            <span>Branch</span>
+                            <span className="text-foreground">{sessionGit?.branch ?? selectedSession.worktree.branch}</span>
+                          </div>
+                          <div className="mt-1 flex items-center justify-between gap-2">
+                            <span>Base</span>
+                            <span>{sessionGit?.baseBranch ?? "main"}</span>
+                          </div>
+                          <div className="mt-1 flex items-center justify-between gap-2">
+                            <span>Status</span>
+                            <span>{sessionGit?.clean ? "Clean" : `${sessionGit?.changedFiles.length ?? 0} changed files`}</span>
+                          </div>
+                        </div>
+
+                        {sessionGit?.changedFiles.length ? (
+                          <div className="rounded-lg border border-border px-3 py-2">
+                            <div className="font-medium text-foreground">Changed files</div>
+                            <div className="mt-2 space-y-1">
+                              {sessionGit.changedFiles.map((file) => (
+                                <div key={file.path} className="flex items-center justify-between gap-2">
+                                  <span className="truncate">{file.path}</span>
+                                  <span>
+                                    {file.untracked ? "New" : file.staged ? "Staged" : "Modified"}
+                                  </span>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        ) : null}
+
+                        <input
+                          value={commitMessage}
+                          onChange={(event) => setCommitMessage(event.target.value)}
+                          placeholder="Commit message"
+                          className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none transition focus:border-foreground/30"
+                        />
+                        <div className="flex gap-2">
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="flex-1 justify-center"
+                            onClick={handleCommitSessionChanges}
+                            disabled={isCommitting || !commitMessage.trim()}
+                          >
+                            {isCommitting ? "Committing..." : "Commit"}
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            className="flex-1 justify-center"
+                            onClick={handlePushSessionBranch}
+                            disabled={isPushing || !sessionGit?.canPush}
+                          >
+                            {isPushing ? "Pushing..." : "Push"}
+                          </Button>
+                        </div>
+                        <input
+                          value={pullRequestTitle}
+                          onChange={(event) => setPullRequestTitle(event.target.value)}
+                          placeholder="Pull request title"
+                          className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none transition focus:border-foreground/30"
+                        />
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          className="w-full justify-center"
+                          onClick={handleCreatePullRequest}
+                          disabled={isCreatingPullRequest || !sessionGit?.canCreatePr}
+                        >
+                          {isCreatingPullRequest ? "Opening PR..." : "Open pull request"}
+                        </Button>
+                        {pullRequestUrl ? (
+                          <button
+                            type="button"
+                            className="block truncate text-left text-primary underline underline-offset-4"
+                            onClick={() => void window.hawkcode.openExternalUrl(pullRequestUrl)}
+                          >
+                            {pullRequestUrl}
+                          </button>
+                        ) : null}
+                        {sessionGitError ? <div className="text-destructive">{sessionGitError}</div> : null}
+                      </>
+                    ) : (
+                      <div className="rounded-lg border border-dashed border-border px-3 py-2">
+                        Create a session worktree first to commit, push, and open a PR.
+                      </div>
+                    )}
                   </CardContent>
                 </Card>
               </div>

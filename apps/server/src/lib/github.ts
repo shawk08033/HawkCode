@@ -37,6 +37,13 @@ type GitHubRepoResponse = {
   };
 };
 
+type GitHubPullRequestResponse = {
+  html_url: string;
+  number: number;
+  title: string;
+  state: string;
+};
+
 function getConfiguredGitHubClientId() {
   const trimmed = loadRuntimeConfig()?.githubClientId?.trim();
   return trimmed ? trimmed : null;
@@ -207,4 +214,49 @@ export async function listGitHubRepos(accessToken: string) {
     private: repo.private,
     ownerLogin: repo.owner.login
   }));
+}
+
+export async function createGitHubPullRequest(input: {
+  accessToken: string;
+  owner: string;
+  repo: string;
+  title: string;
+  body?: string;
+  head: string;
+  base: string;
+}) {
+  const response = await fetch(`https://api.github.com/repos/${input.owner}/${input.repo}/pulls`, {
+    method: "POST",
+    headers: {
+      Accept: "application/vnd.github+json",
+      Authorization: `Bearer ${input.accessToken}`,
+      "User-Agent": "HawkCode",
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      title: input.title,
+      body: input.body,
+      head: input.head,
+      base: input.base
+    })
+  });
+
+  if (!response.ok) {
+    const errorBody = (await response.json().catch(() => null)) as
+      | { message?: string }
+      | null;
+    throw new Error(
+      response.status === 401
+        ? "github_token_invalid"
+        : errorBody?.message || "github_pull_request_create_failed"
+    );
+  }
+
+  const data = await parseJsonResponse<GitHubPullRequestResponse>(response);
+  return {
+    url: data.html_url,
+    number: data.number,
+    title: data.title,
+    state: data.state
+  };
 }
