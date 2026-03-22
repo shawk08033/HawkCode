@@ -3,15 +3,19 @@ import { z } from "zod";
 import { prisma } from "../lib/prisma.js";
 import { getSessionUser } from "../lib/auth-session.js";
 import {
+  createGitHubPullRequest,
   fetchGitHubRepo,
   isGitHubAuthConfigured,
   listGitHubRepos
 } from "../lib/github.js";
 import {
+  commitGitChanges,
   createGitWorktree,
   getGitDiffForFile,
+  getGitChangedFiles,
   getGitSnapshot,
   listDirectoryEntries,
+  pushGitBranch,
   readTextFile,
   removeGitWorktree,
   syncGitRepoToPath,
@@ -50,6 +54,16 @@ const sessionFilesQuerySchema = z.object({
 const updateSessionFileBodySchema = z.object({
   path: z.string().min(1),
   content: z.string()
+});
+
+const sessionCommitBodySchema = z.object({
+  message: z.string().min(1).max(240)
+});
+
+const sessionPullRequestBodySchema = z.object({
+  title: z.string().min(1).max(240).optional(),
+  body: z.string().max(10000).optional(),
+  baseBranch: z.string().min(1).max(120).optional()
 });
 
 function normalizeOptional(value?: string | null) {
@@ -533,6 +547,50 @@ function buildSessionWorktreeRecord(input: {
     currentPath: input.filePath ?? "",
     entries: input.entries ?? [],
     file: input.file ?? null
+  };
+}
+
+async function buildSessionGitState(input: {
+  session: Awaited<ReturnType<typeof getAuthorizedSession>>;
+  project: Awaited<ReturnType<typeof getAuthorizedProject>>;
+}) {
+  const worktree = input.session.sessionWorktree;
+  if (!worktree) {
+    return {
+      branch: null,
+      baseBranch: input.project.worktrees[0]?.branch ?? null,
+      repoUrl: input.project.gitRepos[0]?.repoUrl ?? null,
+      clean: true,
+      changedFiles: [],
+      ahead: null,
+      behind: null,
+      lastCommit: null,
+      canPush: false,
+      canCreatePr: false
+    };
+  }
+
+  const [snapshot, changedFiles] = await Promise.all([
+    getGitSnapshot(worktree.path),
+    getGitChangedFiles(worktree.path)
+  ]);
+
+  return {
+    branch: snapshot.branch,
+    baseBranch: input.project.worktrees[0]?.branch ?? null,
+    repoUrl: input.project.gitRepos[0]?.repoUrl ?? null,
+    clean: snapshot.clean,
+    changedFiles: changedFiles.map((file) => ({
+      path: file.path,
+      staged: file.x !== " " && file.x !== "?",
+      modified: file.y !== " ",
+      untracked: file.x === "?" && file.y === "?"
+    })),
+    ahead: snapshot.ahead,
+    behind: snapshot.behind,
+    lastCommit: snapshot.lastCommit,
+    canPush: Boolean(input.project.gitRepos[0]),
+    canCreatePr: Boolean(input.project.gitRepos[0])
   };
 }
 
@@ -1285,6 +1343,64 @@ export async function registerWorkspaceRoutes(server: FastifyInstance) {
     }
   });
 
+  server.get("/sessions/:sessionId/git", async (request, reply) => {
+    const user = await getSessionUser(request.cookies.hawkcode_session);
+    if (!user) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+
+    const sessionId = (request.params as { sessionId: string }).sessionId;
+
+    try {
+      const session = await getAuthorizedSession({
+        sessionId,
+        memberships: user.memberships
+      });
+      if (!session.projectId) {
+        return reply.send({
+          git: {
+            branch: session.sessionWorktree?.branch ?? null,
+            baseBranch: null,
+            repoUrl: null,
+            clean: true,
+            changedFiles: [],
+            ahead: null,
+            behind: null,
+            lastCommit: null,
+            canPush: false,
+            canCreatePr: false
+          }
+        });
+      }
+
+      const project = await getAuthorizedProject({
+        workspaceId: session.workspaceId,
+        projectId: session.projectId,
+        memberships: user.memberships
+      });
+
+      return reply.send({
+        git: await buildSessionGitState({
+          session,
+          project
+        })
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message === "session_not_found") {
+        return reply.code(404).send({ error: "session_not_found" });
+      }
+      if (error instanceof Error && error.message === "project_not_found") {
+        return reply.code(404).send({ error: "project_not_found" });
+      }
+      if (error instanceof Error && error.message === "forbidden") {
+        return reply.code(403).send({ error: "forbidden" });
+      }
+
+      request.log.error(error);
+      return reply.code(500).send({ error: "session_git_failed" });
+    }
+  });
+
   server.get("/sessions/:sessionId/file", async (request, reply) => {
     const user = await getSessionUser(request.cookies.hawkcode_session);
     if (!user) {
@@ -1341,6 +1457,193 @@ export async function registerWorkspaceRoutes(server: FastifyInstance) {
       return reply.code(500).send({
         error: "session_file_read_failed"
       });
+    }
+  });
+
+  server.post("/sessions/:sessionId/commit", async (request, reply) => {
+    const user = await getSessionUser(request.cookies.hawkcode_session);
+    if (!user) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+
+    const sessionId = (request.params as { sessionId: string }).sessionId;
+    const parsedBody = sessionCommitBodySchema.safeParse(request.body);
+    if (!parsedBody.success) {
+      return reply.code(400).send({
+        error: "invalid_request",
+        details: parsedBody.error.flatten()
+      });
+    }
+
+    try {
+      const session = await getAuthorizedSession({
+        sessionId,
+        memberships: user.memberships
+      });
+      if (!session.sessionWorktree || !session.projectId) {
+        return reply.code(400).send({ error: "worktree_not_found" });
+      }
+
+      const project = await getAuthorizedProject({
+        workspaceId: session.workspaceId,
+        projectId: session.projectId,
+        memberships: user.memberships
+      });
+
+      const snapshot = await commitGitChanges({
+        repoPath: session.sessionWorktree.path,
+        message: parsedBody.data.message,
+        authorName: user.githubAccount?.name || user.githubAccount?.login || user.email,
+        authorEmail: user.githubAccount?.email || user.email
+      });
+
+      return reply.send({
+        git: await buildSessionGitState({ session, project }),
+        snapshot
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message === "nothing_to_commit") {
+        return reply.code(400).send({ error: "nothing_to_commit" });
+      }
+      if (error instanceof Error && error.message === "session_not_found") {
+        return reply.code(404).send({ error: "session_not_found" });
+      }
+      if (error instanceof Error && error.message === "project_not_found") {
+        return reply.code(404).send({ error: "project_not_found" });
+      }
+      if (error instanceof Error && error.message === "forbidden") {
+        return reply.code(403).send({ error: "forbidden" });
+      }
+
+      request.log.error(error);
+      return reply.code(500).send({ error: "session_commit_failed" });
+    }
+  });
+
+  server.post("/sessions/:sessionId/push", async (request, reply) => {
+    const user = await getSessionUser(request.cookies.hawkcode_session);
+    if (!user) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+
+    const sessionId = (request.params as { sessionId: string }).sessionId;
+
+    try {
+      const session = await getAuthorizedSession({
+        sessionId,
+        memberships: user.memberships
+      });
+      if (!session.sessionWorktree || !session.projectId) {
+        return reply.code(400).send({ error: "worktree_not_found" });
+      }
+      if (!user.githubAccount?.accessToken) {
+        return reply.code(400).send({ error: "github_not_connected" });
+      }
+
+      const project = await getAuthorizedProject({
+        workspaceId: session.workspaceId,
+        projectId: session.projectId,
+        memberships: user.memberships
+      });
+
+      const snapshot = await pushGitBranch({
+        repoPath: session.sessionWorktree.path,
+        branch: session.sessionWorktree.branch,
+        githubToken: user.githubAccount.accessToken
+      });
+
+      return reply.send({
+        git: await buildSessionGitState({ session, project }),
+        snapshot
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message === "session_not_found") {
+        return reply.code(404).send({ error: "session_not_found" });
+      }
+      if (error instanceof Error && error.message === "project_not_found") {
+        return reply.code(404).send({ error: "project_not_found" });
+      }
+      if (error instanceof Error && error.message === "forbidden") {
+        return reply.code(403).send({ error: "forbidden" });
+      }
+
+      request.log.error(error);
+      return reply.code(500).send({ error: "session_push_failed" });
+    }
+  });
+
+  server.post("/sessions/:sessionId/pull-request", async (request, reply) => {
+    const user = await getSessionUser(request.cookies.hawkcode_session);
+    if (!user) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+
+    const sessionId = (request.params as { sessionId: string }).sessionId;
+    const parsedBody = sessionPullRequestBodySchema.safeParse(request.body);
+    if (!parsedBody.success) {
+      return reply.code(400).send({
+        error: "invalid_request",
+        details: parsedBody.error.flatten()
+      });
+    }
+
+    try {
+      const session = await getAuthorizedSession({
+        sessionId,
+        memberships: user.memberships
+      });
+      if (!session.sessionWorktree || !session.projectId) {
+        return reply.code(400).send({ error: "worktree_not_found" });
+      }
+      if (!user.githubAccount?.accessToken) {
+        return reply.code(400).send({ error: "github_not_connected" });
+      }
+
+      const project = await getAuthorizedProject({
+        workspaceId: session.workspaceId,
+        projectId: session.projectId,
+        memberships: user.memberships
+      });
+      const repo = project.gitRepos[0];
+      if (!repo) {
+        return reply.code(400).send({ error: "repo_not_connected" });
+      }
+
+      const parsedRepo = parseGithubRepoUrl(repo.repoUrl);
+      if (!parsedRepo) {
+        return reply.code(400).send({ error: "invalid_repo_url" });
+      }
+
+      const pullRequest = await createGitHubPullRequest({
+        accessToken: user.githubAccount.accessToken,
+        owner: parsedRepo.owner,
+        repo: parsedRepo.repo,
+        title: parsedBody.data.title ?? session.title ?? `HawkCode changes for ${project.name}`,
+        body: parsedBody.data.body,
+        head: session.sessionWorktree.branch,
+        base: parsedBody.data.baseBranch ?? project.worktrees[0]?.branch ?? "main"
+      });
+
+      return reply.send({
+        git: await buildSessionGitState({ session, project }),
+        pullRequest
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message === "github_token_invalid") {
+        return reply.code(401).send({ error: "github_token_invalid" });
+      }
+      if (error instanceof Error && error.message === "session_not_found") {
+        return reply.code(404).send({ error: "session_not_found" });
+      }
+      if (error instanceof Error && error.message === "project_not_found") {
+        return reply.code(404).send({ error: "project_not_found" });
+      }
+      if (error instanceof Error && error.message === "forbidden") {
+        return reply.code(403).send({ error: "forbidden" });
+      }
+
+      request.log.error(error);
+      return reply.code(500).send({ error: "session_pull_request_failed" });
     }
   });
 

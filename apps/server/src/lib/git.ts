@@ -8,6 +8,7 @@ const execFileAsync = promisify(execFile);
 type GitRunOptions = {
   cwd?: string;
   githubToken?: string;
+  config?: string[];
 };
 
 function normalizeRepoUrl(raw?: string | null) {
@@ -41,13 +42,15 @@ function normalizeRepoUrl(raw?: string | null) {
   }
 }
 
-function buildGitArgs(args: string[], githubToken?: string) {
+function buildGitArgs(args: string[], githubToken?: string, config?: string[]) {
+  const configArgs = (config ?? []).flatMap((entry) => ["-c", entry]);
   if (!githubToken) {
-    return args;
+    return [...configArgs, ...args];
   }
 
   const authHeader = Buffer.from(`x-access-token:${githubToken}`).toString("base64");
   return [
+    ...configArgs,
     "-c",
     `http.extraHeader=AUTHORIZATION: basic ${authHeader}`,
     "-c",
@@ -59,11 +62,21 @@ function buildGitArgs(args: string[], githubToken?: string) {
 }
 
 async function runGit(args: string[], options: GitRunOptions = {}) {
-  const result = await execFileAsync("git", buildGitArgs(args, options.githubToken), {
+  const result = await execFileAsync("git", buildGitArgs(args, options.githubToken, options.config), {
     cwd: options.cwd,
     env: process.env
   });
   return result.stdout.trim();
+}
+
+function parseChangedFilePath(line: string) {
+  const raw = line.slice(3).trim();
+  if (!raw) {
+    return null;
+  }
+
+  const renamed = raw.split(" -> ").pop();
+  return renamed?.replace(/^"+|"+$/g, "") ?? null;
 }
 
 function parseBranchStatus(summary: string) {
@@ -205,6 +218,26 @@ export async function getGitSnapshot(repoPath: string) {
       committedAt: lastCommitAt
     }
   };
+}
+
+export async function getGitChangedFiles(repoPath: string) {
+  const porcelain = await runGit(["status", "--porcelain"], { cwd: repoPath });
+  const lines = porcelain.split(/\r?\n/).filter(Boolean);
+
+  return lines
+    .map((line) => {
+      const path = parseChangedFilePath(line);
+      if (!path) {
+        return null;
+      }
+
+      return {
+        path,
+        x: line[0] ?? " ",
+        y: line[1] ?? " "
+      };
+    })
+    .filter((entry): entry is { path: string; x: string; y: string } => Boolean(entry));
 }
 
 export async function syncGitRepoToPath(input: {
@@ -412,6 +445,42 @@ export async function getGitDiffForFile(rootPath: string, relativePath: string) 
     content: diff,
     hasChanges: diff.trim().length > 0
   };
+}
+
+export async function commitGitChanges(input: {
+  repoPath: string;
+  message: string;
+  authorName: string;
+  authorEmail: string;
+}) {
+  await runGit(["add", "-A"], { cwd: input.repoPath });
+  const changedFiles = await getGitChangedFiles(input.repoPath);
+  if (changedFiles.length === 0) {
+    throw new Error("nothing_to_commit");
+  }
+
+  await runGit(["commit", "-m", input.message], {
+    cwd: input.repoPath,
+    config: [
+      `user.name=${input.authorName}`,
+      `user.email=${input.authorEmail}`
+    ]
+  });
+
+  return getGitSnapshot(input.repoPath);
+}
+
+export async function pushGitBranch(input: {
+  repoPath: string;
+  branch: string;
+  githubToken?: string;
+}) {
+  await runGit(["push", "-u", "origin", input.branch], {
+    cwd: input.repoPath,
+    githubToken: input.githubToken
+  });
+
+  return getGitSnapshot(input.repoPath);
 }
 
 export async function getLocalGitSnapshot() {
