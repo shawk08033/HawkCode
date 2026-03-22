@@ -44,6 +44,8 @@ if (devServerUrl) {
 
 const pendingCerts = new Map<string, PendingCert>();
 const codexCommand = "codex";
+const geminiCommand = "gemini";
+const defaultGeminiModel = process.env.HAWKCODE_GEMINI_MODEL?.trim() || "auto";
 const defaultCursorModel = process.env.HAWKCODE_CURSOR_MODEL?.trim() || "auto";
 let codexAuthState: {
   loggedIn: boolean;
@@ -55,6 +57,19 @@ let codexAuthState: {
 } = {
   loggedIn: false,
   inProgress: false
+};
+let geminiCliState: {
+  found: boolean;
+  loggedIn: boolean;
+  command: string | null;
+  email?: string;
+  statusText: string;
+  error?: string;
+} = {
+  found: false,
+  loggedIn: false,
+  command: null,
+  statusText: "Gemini CLI not found"
 };
 let cursorCliState: {
   found: boolean;
@@ -82,6 +97,41 @@ function extractDeviceCode(value: string) {
 
 function stripAnsi(value: string) {
   return value.replace(/\u001B\[[0-?]*[ -/]*[@-~]/g, "");
+}
+
+function getResolvedGeminiCommand() {
+  const explicit = process.env.HAWKCODE_GEMINI_PATH?.trim();
+  const candidates = [
+    explicit,
+    geminiCommand,
+    "/usr/bin/gemini",
+    "/usr/local/bin/gemini",
+    "/opt/homebrew/bin/gemini"
+  ].filter((value): value is string => Boolean(value && value.length > 0));
+
+  for (const candidate of candidates) {
+    if (!candidate.includes("/")) {
+      try {
+        const result = execFileSync("bash", ["-lc", `command -v ${candidate}`], {
+          cwd: process.cwd(),
+          env: process.env,
+          encoding: "utf8",
+          stdio: ["ignore", "pipe", "ignore"]
+        }).trim();
+        if (result) {
+          return result;
+        }
+      } catch {
+        continue;
+      }
+    }
+
+    if (fs.existsSync(candidate)) {
+      return candidate;
+    }
+  }
+
+  return null;
 }
 
 function getResolvedCursorCommand() {
@@ -147,6 +197,19 @@ function getCursorEnv(command: string) {
   };
 }
 
+function getGeminiEnv() {
+  const env = {
+    ...process.env,
+    GEMINI_DEFAULT_AUTH_TYPE: "oauth-personal"
+  } as NodeJS.ProcessEnv;
+
+  delete env.GEMINI_API_KEY;
+  delete env.GOOGLE_API_KEY;
+  delete env.GOOGLE_GENAI_USE_VERTEXAI;
+
+  return env;
+}
+
 function buildCliPrompt(providerLabel: string, messages: Array<{ role: string; content: string }>) {
   return [
     `You are the ${providerLabel} agent inside HawkCode.`,
@@ -188,6 +251,48 @@ function buildCursorPrompt(messages: Array<{ role: string; content: string }>) {
     "Latest user request:",
     summarizeForCursor(latestUserMessage?.content ?? messages[messages.length - 1]?.content ?? "")
   ].join("\n");
+}
+
+function buildGeminiPrompt(messages: Array<{ role: string; content: string }>) {
+  const recentMessages = messages.slice(-8);
+  const latestUserMessage = [...recentMessages].reverse().find((message) => message.role === "user");
+  const contextMessages = recentMessages.slice(0, latestUserMessage ? -1 : recentMessages.length);
+
+  return [
+    "You are the Gemini agent inside HawkCode.",
+    "Answer the latest user request.",
+    "Return only the assistant reply text.",
+    "Do not modify files, run shell commands, or make tool calls.",
+    "",
+    "Recent conversation context:",
+    ...contextMessages.map((message) => `${message.role}: ${summarizeForCursor(message.content)}`),
+    "",
+    "Latest user request:",
+    summarizeForCursor(latestUserMessage?.content ?? messages[messages.length - 1]?.content ?? "")
+  ].join("\n");
+}
+
+function extractJsonObject(value: string) {
+  const text = stripAnsi(value).trim();
+  if (!text) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(text) as unknown;
+  } catch {
+    const start = text.indexOf("{");
+    const end = text.lastIndexOf("}");
+    if (start < 0 || end <= start) {
+      return null;
+    }
+
+    try {
+      return JSON.parse(text.slice(start, end + 1)) as unknown;
+    } catch {
+      return null;
+    }
+  }
 }
 
 async function getCodexAuthStatus() {
@@ -281,6 +386,52 @@ function startCodexAuth() {
   return codexAuthState;
 }
 
+function readJsonFile<T>(filePath: string) {
+  try {
+    const raw = fs.readFileSync(filePath, "utf8");
+    return JSON.parse(raw) as T;
+  } catch {
+    return null;
+  }
+}
+
+async function getGeminiCliStatus() {
+  const resolvedCommand = getResolvedGeminiCommand();
+  if (!resolvedCommand) {
+    geminiCliState = {
+      found: false,
+      loggedIn: false,
+      command: null,
+      statusText: "Gemini CLI not found"
+    };
+    return geminiCliState;
+  }
+
+  const geminiDir = path.join(homedir(), ".gemini");
+  const settings = readJsonFile<{ security?: { auth?: { selectedType?: string } } }>(
+    path.join(geminiDir, "settings.json")
+  );
+  const accounts = readJsonFile<{ active?: string }>(path.join(geminiDir, "google_accounts.json"));
+  const selectedType = settings?.security?.auth?.selectedType?.trim();
+  const email = accounts?.active?.trim();
+  const loggedIn = selectedType === "oauth-personal" && Boolean(email);
+
+  geminiCliState = {
+    found: true,
+    loggedIn,
+    command: resolvedCommand,
+    email,
+    statusText: loggedIn
+      ? `Signed in with Google${email ? `: ${email}` : ""}`
+      : selectedType && selectedType !== "oauth-personal"
+        ? `Gemini CLI is configured for ${selectedType}, not Google sign-in.`
+        : "Gemini CLI is installed, but Google sign-in is not complete.",
+    error: undefined
+  };
+
+  return geminiCliState;
+}
+
 async function generateCodexReply(messages: Array<{ role: string; content: string }>, model = "gpt-5") {
   const outputFile = path.join(
     await fsp.mkdtemp(path.join(tmpdir(), "hawkcode-desktop-codex-")),
@@ -315,6 +466,60 @@ async function generateCodexReply(messages: Array<{ role: string; content: strin
 
   return {
     provider: "codex" as const,
+    model,
+    content
+  };
+}
+
+async function generateGeminiReply(messages: Array<{ role: string; content: string }>, model = defaultGeminiModel) {
+  const resolvedCommand = getResolvedGeminiCommand();
+  if (!resolvedCommand) {
+    throw new Error(
+      "Gemini CLI not found. Install it with `npm install -g @google/gemini-cli`, then sign in with Google from `gemini`."
+    );
+  }
+
+  const prompt = buildGeminiPrompt(messages);
+  const args = [
+    "-p",
+    prompt,
+    "--output-format",
+    "json",
+    "--approval-mode",
+    "plan"
+  ];
+  if (model && model.trim().length > 0 && model !== "auto") {
+    args.push("-m", model);
+  }
+
+  let stdout = "";
+  let stderr = "";
+  try {
+    const result = await execFileAsync(resolvedCommand, args, {
+      cwd: process.cwd(),
+      env: getGeminiEnv()
+    });
+    stdout = result.stdout;
+    stderr = result.stderr;
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Gemini CLI request failed.";
+    throw new Error(`Gemini CLI request failed: ${message}`);
+  }
+
+  let payload: { response?: string };
+  const parsed = extractJsonObject(stdout) ?? extractJsonObject(stderr) ?? extractJsonObject(`${stdout}\n${stderr}`);
+  if (!parsed || typeof parsed !== "object") {
+    throw new Error("Gemini CLI returned invalid JSON.");
+  }
+  payload = parsed as { response?: string };
+
+  const content = payload.response?.trim() ?? "";
+  if (!content) {
+    throw new Error("Gemini CLI returned an empty response.");
+  }
+
+  return {
+    provider: "gemini" as const,
     model,
     content
   };
@@ -510,13 +715,22 @@ async function generateCursorReply(messages: Array<{ role: string; content: stri
 }
 
 async function getDesktopAgentProviders() {
-  const providers: Array<{ name: "codex" | "cursor"; label: string; defaultModel: string }> = [];
+  const providers: Array<{ name: "codex" | "cursor" | "gemini"; label: string; defaultModel: string }> = [];
   const codexStatus = await getCodexAuthStatus();
   if (codexStatus.loggedIn) {
     providers.push({
       name: "codex",
       label: "Codex",
       defaultModel: "gpt-5"
+    });
+  }
+
+  const geminiStatus = await getGeminiCliStatus();
+  if (geminiStatus.loggedIn) {
+    providers.push({
+      name: "gemini",
+      label: "Gemini CLI",
+      defaultModel: defaultGeminiModel
     });
   }
 
@@ -677,6 +891,10 @@ app.whenReady().then(() => {
     return getCodexAuthStatus();
   });
 
+  ipcMain.handle("hawkcode:get-gemini-cli-status", async () => {
+    return getGeminiCliStatus();
+  });
+
   ipcMain.handle("hawkcode:get-cursor-cli-status", async () => {
     return getCursorCliStatus();
   });
@@ -698,6 +916,9 @@ app.whenReady().then(() => {
   ipcMain.handle("hawkcode:generate-local-agent-reply", async (_event, payload) => {
     if (payload.provider === "codex") {
       return generateCodexReply(payload.messages, payload.model);
+    }
+    if (payload.provider === "gemini") {
+      return generateGeminiReply(payload.messages, payload.model);
     }
     if (payload.provider === "cursor") {
       return generateCursorReply(payload.messages, payload.model);

@@ -208,6 +208,8 @@ function formatProviderLabel(provider?: string) {
     ? "Codex"
     : provider === "cursor"
       ? "Cursor CLI"
+      : provider === "gemini"
+        ? "Gemini CLI"
       : provider === "openrouter"
         ? "OpenRouter"
         : "Agent";

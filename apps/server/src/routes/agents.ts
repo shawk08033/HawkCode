@@ -28,6 +28,8 @@ function formatProviderLabel(provider: string) {
     ? "Codex"
     : provider === "cursor"
       ? "Cursor CLI"
+      : provider === "gemini"
+        ? "Gemini CLI"
       : provider === "openrouter"
         ? "OpenRouter"
         : "Agent";
@@ -177,7 +179,7 @@ async function createToolCall(options: {
 }
 
 async function persistAgentReply(options: {
-  provider: "codex" | "cursor" | "openrouter";
+  provider: "codex" | "cursor" | "gemini" | "openrouter";
   model: string;
   sessionId?: string;
   message: string;

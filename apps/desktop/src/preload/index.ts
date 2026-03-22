@@ -9,12 +9,13 @@ contextBridge.exposeInMainWorld("hawkcode", {
     ipcRenderer.invoke("hawkcode:get-pending-cert", hostname),
   trustCert: (hostname: string) => ipcRenderer.invoke("hawkcode:trust-cert", hostname),
   getCodexAuthStatus: () => ipcRenderer.invoke("hawkcode:get-codex-auth-status"),
+  getGeminiCliStatus: () => ipcRenderer.invoke("hawkcode:get-gemini-cli-status"),
   getCursorCliStatus: () => ipcRenderer.invoke("hawkcode:get-cursor-cli-status"),
   startCodexAuth: () => ipcRenderer.invoke("hawkcode:start-codex-auth"),
   startCursorCliAuth: () => ipcRenderer.invoke("hawkcode:start-cursor-cli-auth"),
   openExternalUrl: (url: string) => ipcRenderer.invoke("hawkcode:open-external-url", url),
   generateLocalAgentReply: (payload: {
-    provider: "codex" | "cursor";
+    provider: "codex" | "cursor" | "gemini";
     messages: Array<{ role: string; content: string }>;
     model?: string;
   }) => ipcRenderer.invoke("hawkcode:generate-local-agent-reply", payload)
