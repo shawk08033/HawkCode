@@ -13,14 +13,14 @@ type User = {
 };
 
 type ProviderInfo = {
-  name: "codex" | "openrouter";
+  name: "codex" | "cursor" | "openrouter";
   label: string;
   defaultModel: string;
 };
 
 type ChatMessage = {
   id: string;
-  role: "user" | "assistant";
+  role: "user" | "assistant" | "system";
   content: string;
   timestamp: string;
 };
@@ -91,7 +91,7 @@ type WorkspaceGithubState = {
 type AgentReplyResponse = {
   sessionId: string;
   agentRunId: string;
-  provider: "codex" | "openrouter";
+  provider: "codex" | "cursor" | "openrouter";
   model: string;
   message: {
     id: string;
@@ -225,6 +225,19 @@ function preferProvider(providers: ProviderInfo[]) {
   return providers.find((provider) => provider.name === "codex") ?? providers[0] ?? null;
 }
 
+function formatProviderRunLabel(provider: ProviderInfo, model: string) {
+  return `${provider.label} · ${model}`;
+}
+
+function buildModelSwitchNote(nextRunLabel: string) {
+  return `Model changed to ${nextRunLabel}.`;
+}
+
+function getModelSwitchNote(session: SessionRecord, provider: ProviderInfo, model: string) {
+  const nextRunLabel = formatProviderRunLabel(provider, model);
+  return session.model === nextRunLabel ? null : buildModelSwitchNote(nextRunLabel);
+}
+
 export default function AppHome() {
   const [serverUrl, setServerUrl] = useState(DEFAULT_URL);
   const [user, setUser] = useState<User | null>(null);
@@ -235,7 +248,7 @@ export default function AppHome() {
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<string | null>(null);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
-  const [selectedProvider, setSelectedProvider] = useState<"codex" | "openrouter" | null>(null);
+  const [selectedProvider, setSelectedProvider] = useState<"codex" | "cursor" | "openrouter" | null>(null);
   const [isSending, setIsSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
   const [workspaceGithub, setWorkspaceGithub] = useState<WorkspaceGithubState | null>(null);
@@ -736,10 +749,42 @@ export default function AppHome() {
           return {
             ...session,
             serverSessionId: response.sessionId,
-            model: activeProvider?.label ?? session.model,
+            model:
+              activeProvider && response.model
+                ? formatProviderRunLabel(activeProvider, response.model)
+                : session.model,
             updated: "Just now",
             status: "Live",
             messages: nextMessages
+          };
+        })
+      }))
+    );
+  }
+
+  function appendSessionNote(localSessionId: string, note: string) {
+    const noteId = `system-note-${Date.now()}`;
+
+    setWorkspaceTree((current) =>
+      current.map((workspace) => ({
+        ...workspace,
+        sessions: workspace.sessions.map((session) => {
+          if (session.id !== localSessionId) {
+            return session;
+          }
+
+          return {
+            ...session,
+            updated: "Just now",
+            messages: [
+              ...session.messages,
+              {
+                id: noteId,
+                role: "system",
+                content: note,
+                timestamp: formatTimestamp()
+              }
+            ]
           };
         })
       }))
@@ -751,6 +796,11 @@ export default function AppHome() {
       return;
     }
 
+    const nextModel = activeProvider.defaultModel;
+    const modelSwitchNote = getModelSwitchNote(selectedSession, activeProvider, nextModel);
+    if (modelSwitchNote) {
+      appendSessionNote(selectedSession.id, modelSwitchNote);
+    }
     setIsSending(true);
     setSendError(null);
 
@@ -761,7 +811,7 @@ export default function AppHome() {
         credentials: "include",
         body: JSON.stringify({
           provider: activeProvider.name,
-          model: activeProvider.defaultModel,
+          model: nextModel,
           sessionId: selectedSession.serverSessionId,
           message: draft.trim()
         })
@@ -1253,17 +1303,31 @@ export default function AppHome() {
                 {selectedSession.messages.map((message) => (
                   <div
                     key={message.id}
-                    className={`flex ${message.role === "user" ? "justify-end" : "justify-start"}`}
+                    className={`flex ${
+                      message.role === "system"
+                        ? "justify-center"
+                        : message.role === "user"
+                          ? "justify-end"
+                          : "justify-start"
+                    }`}
                   >
                     <div
                       className={`max-w-3xl rounded-3xl px-4 py-3 ${
-                        message.role === "user"
+                        message.role === "system"
+                          ? "border border-dashed border-border bg-background text-muted-foreground"
+                          : message.role === "user"
                           ? "bg-primary text-primary-foreground"
                           : "border border-border bg-card"
                       }`}
                     >
                       <div className="mb-2 flex items-center gap-2 text-[11px] uppercase tracking-[0.18em] opacity-70">
-                        <span>{message.role === "user" ? "You" : "Assistant"}</span>
+                        <span>
+                          {message.role === "system"
+                            ? "Session note"
+                            : message.role === "user"
+                              ? "You"
+                              : "Assistant"}
+                        </span>
                         <span>{message.timestamp}</span>
                       </div>
                       <p className="whitespace-pre-wrap text-sm leading-6">{message.content}</p>
@@ -1336,7 +1400,7 @@ export default function AppHome() {
                     <select
                       value={selectedProvider ?? ""}
                       onChange={(event) =>
-                        setSelectedProvider(event.target.value as "codex" | "openrouter")
+                        setSelectedProvider(event.target.value as "codex" | "cursor" | "openrouter")
                       }
                       className="h-9 rounded-md border border-border bg-background px-3 text-sm"
                       disabled={providers.length === 0 || isSending}

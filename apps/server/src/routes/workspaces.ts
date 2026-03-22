@@ -203,6 +203,25 @@ function parseToolCallInput(raw?: string | null) {
   }
 }
 
+function formatProviderLabel(provider?: string) {
+  return provider === "codex"
+    ? "Codex"
+    : provider === "cursor"
+      ? "Cursor CLI"
+      : provider === "openrouter"
+        ? "OpenRouter"
+        : "Agent";
+}
+
+function formatRunLabel(provider?: string, model?: string) {
+  const providerLabel = formatProviderLabel(provider);
+  return model ? `${providerLabel} · ${model}` : providerLabel;
+}
+
+function displayMessageContent(content: string) {
+  return content.replace(/^\[Session note\]\s*/, "").trim();
+}
+
 function buildSessionRecord(session: {
   id: string;
   title: string | null;
@@ -235,12 +254,6 @@ function buildSessionRecord(session: {
   const latestToolCall = latestRun?.toolCalls[0];
   const sessionWorktree = session.sessionWorktree ?? null;
   const providerInfo = parseToolCallInput(latestToolCall?.input);
-  const providerLabel =
-    providerInfo?.provider === "codex"
-      ? "Codex"
-      : providerInfo?.provider === "openrouter"
-        ? "OpenRouter"
-        : "Agent";
 
   return {
     id: session.id,
@@ -248,7 +261,7 @@ function buildSessionRecord(session: {
     projectId: session.project?.id ?? null,
     projectName: session.project?.name ?? null,
     updated: formatRelativeTime(lastActivity),
-    model: providerLabel,
+    model: formatRunLabel(providerInfo?.provider, providerInfo?.model),
     branch: sessionWorktree?.branch ?? session.project?.name ?? "main",
     worktree: sessionWorktree
       ? {
@@ -265,11 +278,14 @@ function buildSessionRecord(session: {
           : "Idle",
     contextCount: 0,
     messages: session.messages
-      .filter((message) => message.role === "user" || message.role === "assistant")
+      .filter(
+        (message) =>
+          message.role === "user" || message.role === "assistant" || message.role === "system"
+      )
       .map((message) => ({
         id: message.id,
         role: message.role,
-        content: message.content,
+        content: displayMessageContent(message.content),
         timestamp: message.createdAt.toISOString()
       }))
   };

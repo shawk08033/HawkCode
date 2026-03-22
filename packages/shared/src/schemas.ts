@@ -11,8 +11,6 @@ export const setupConfigSchema = z.object({
   githubClientId: z.string().optional(),
   githubAppId: z.string().optional(),
   githubAppKeyPath: z.string().optional(),
-  codexPath: z.string().optional(),
-  codexModel: z.string().optional(),
   openrouterApiKey: z.string().optional(),
   openrouterBaseUrl: z.string().optional(),
   openrouterModel: z.string().optional(),
@@ -24,7 +22,7 @@ export const setupConfigSchema = z.object({
 
 export type SetupConfig = z.infer<typeof setupConfigSchema>;
 
-export const agentProviderSchema = z.enum(["codex", "openrouter"]);
+export const agentProviderSchema = z.enum(["codex", "cursor", "openrouter"]);
 
 export const agentChatRoleSchema = z.enum(["system", "user", "assistant"]);
 
