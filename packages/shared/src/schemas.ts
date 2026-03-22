@@ -6,6 +6,7 @@ export const setupConfigSchema = z.object({
   workspaceName: z.string().min(2),
   dbProvider: z.enum(["postgresql", "sqlite"]),
   databaseUrl: z.string().min(1),
+  serverCheckoutRoot: z.string().optional(),
   redisUrl: z.string().optional(),
   githubClientId: z.string().optional(),
   githubAppId: z.string().optional(),

@@ -28,11 +28,18 @@ type SessionRecord = {
   id: string;
   serverSessionId?: string;
   title: string;
+  projectId?: string | null;
+  projectName?: string | null;
   updated: string;
   model: string;
   branch: string;
   status: string;
   contextCount: number;
+  worktree?: {
+    path: string;
+    branch: string;
+    createdAt: string;
+  } | null;
   messages: ChatMessage[];
 };
 
@@ -63,12 +70,21 @@ type GitHubUserRecord = {
   connectedAt: string;
 };
 
+type AvailableGitHubRepo = {
+  name: string;
+  fullName: string;
+  repoUrl: string;
+  private: boolean;
+  ownerLogin: string;
+};
+
 type WorkspaceGithubState = {
   authConfigured: boolean;
   connected: boolean;
   user: GitHubUserRecord | null;
   canManage: boolean;
   repos: WorkspaceGithubRepo[];
+  availableRepos: AvailableGitHubRepo[];
 };
 
 type AgentReplyResponse = {
@@ -102,37 +118,71 @@ type WorkspaceGithubResponse = {
 };
 
 type WorkspaceGitLocalState = {
-  path: string;
-  branch: string;
-  clean: boolean;
-  changedFiles: number;
-  stagedFiles: number;
-  modifiedFiles: number;
-  deletedFiles: number;
-  untrackedFiles: number;
-  ahead: number;
-  behind: number;
+  path: string | null;
+  branch: string | null;
+  lastSyncedAt: string | null;
+  clean: boolean | null;
+  changedFiles: number | null;
+  stagedFiles: number | null;
+  modifiedFiles: number | null;
+  deletedFiles: number | null;
+  untrackedFiles: number | null;
+  ahead: number | null;
+  behind: number | null;
+  error: string | null;
   lastCommit: {
     sha: string;
     shortSha: string;
     subject: string;
     committedAt: string;
-  };
+  } | null;
+  status: "ready" | "missing" | "error";
 };
 
 type WorkspaceGitRepo = WorkspaceGithubRepo & {
-  local: WorkspaceGitLocalState | null;
+  serverSync: WorkspaceGitLocalState;
 };
 
 type WorkspaceGitState = {
-  detected: boolean;
-  localRepoUrl: string | null;
-  localPath: string | null;
+  checkoutRoot: string;
+  canManage: boolean;
   repos: WorkspaceGitRepo[];
 };
 
 type WorkspaceGitResponse = {
   git?: WorkspaceGitState;
+};
+
+type SessionFileEntry = {
+  name: string;
+  path: string;
+  type: "directory" | "file";
+  size: number | null;
+};
+
+type SessionFileContext = {
+  sessionId: string;
+  projectId: string | null;
+  projectName: string | null;
+  currentPath: string;
+  worktree: {
+    id: string;
+    path: string;
+    branch: string;
+    createdAt: string;
+  } | null;
+  entries: SessionFileEntry[];
+  file: {
+    path: string;
+    content: string;
+    truncated: boolean;
+    size: number;
+    diff?: {
+      path: string;
+      content: string;
+      hasChanges: boolean;
+    } | null;
+  } | null;
 };
 
 type GitHubDeviceStartResponse = {
@@ -153,6 +203,19 @@ type GitHubDevicePollResponse = {
     connected: boolean;
     user: GitHubUserRecord | null;
   };
+};
+
+type EditorTab = {
+  path: string;
+  content: string;
+  savedContent: string;
+  draftContent: string;
+  truncated: boolean;
+  size: number;
+  diffContent: string;
+  hasDiff: boolean;
+  isEditing: boolean;
+  isSaving: boolean;
 };
 
 type GitHubAuthState = {
@@ -630,15 +693,27 @@ export default function App() {
   const [workspaceGit, setWorkspaceGit] = useState<WorkspaceGitState | null>(null);
   const [isLoadingGithub, setIsLoadingGithub] = useState(false);
   const [isLoadingGit, setIsLoadingGit] = useState(false);
+  const [isLoadingFiles, setIsLoadingFiles] = useState(false);
+  const [isCreatingWorktree, setIsCreatingWorktree] = useState(false);
   const [isConnectingGithub, setIsConnectingGithub] = useState(false);
   const [githubError, setGithubError] = useState<string | null>(null);
   const [gitError, setGitError] = useState<string | null>(null);
-  const [githubRepoUrl, setGithubRepoUrl] = useState("");
+  const [fileError, setFileError] = useState<string | null>(null);
+  const [githubRepoQuery, setGithubRepoQuery] = useState("");
+  const [selectedGithubRepoUrl, setSelectedGithubRepoUrl] = useState("");
   const [githubProjectName, setGithubProjectName] = useState("");
   const [sessionQuery, setSessionQuery] = useState("");
   const [githubAuth, setGithubAuth] = useState<GitHubAuthState>({
     inProgress: false
   });
+  const [sessionFiles, setSessionFiles] = useState<SessionFileContext | null>(null);
+  const [openEditorTabs, setOpenEditorTabs] = useState<EditorTab[]>([]);
+  const [activeCenterTab, setActiveCenterTab] = useState<string>("chat");
+  const [activeEditorView, setActiveEditorView] = useState<"source" | "diff">("source");
+  const [selectedFileLineRange, setSelectedFileLineRange] = useState<{ start: number; end: number } | null>(
+    null
+  );
+  const [lineSelectionAnchor, setLineSelectionAnchor] = useState<number | null>(null);
   const [isNearLatest, setIsNearLatest] = useState(true);
   const deferredSessionQuery = useDeferredValue(sessionQuery);
   const chatScrollRef = useRef<HTMLDivElement | null>(null);
@@ -662,6 +737,24 @@ export default function App() {
   const availableProviders = useMemo(
     () => mergeProviders(serverProviders, codexAuth),
     [serverProviders, codexAuth]
+  );
+  const filteredAvailableGithubRepos = useMemo(() => {
+    const query = githubRepoQuery.trim().toLowerCase();
+    const repos = workspaceGithub?.availableRepos ?? [];
+    if (!query) {
+      return repos;
+    }
+
+    return repos.filter((repo) => {
+      return (
+        repo.fullName.toLowerCase().includes(query) ||
+        repo.repoUrl.toLowerCase().includes(query)
+      );
+    });
+  }, [githubRepoQuery, workspaceGithub?.availableRepos]);
+  const syncedRepos = useMemo(
+    () => workspaceGit?.repos.filter((repo) => repo.serverSync.status === "ready") ?? [],
+    [workspaceGit]
   );
   const filteredWorkspaces = useMemo(() => {
     const query = deferredSessionQuery.trim().toLowerCase();
@@ -706,6 +799,19 @@ export default function App() {
     availableProviders.find((provider) => provider.name === selectedProvider) ??
     preferProvider(availableProviders);
   const availableModels = useMemo(() => getModelOptions(activeProvider), [activeProvider]);
+  const selectedProjectRepo =
+    syncedRepos.find((repo) => repo.projectId === selectedSession?.projectId) ?? null;
+  const activeEditorTab = useMemo(
+    () => openEditorTabs.find((tab) => tab.path === activeCenterTab) ?? null,
+    [activeCenterTab, openEditorTabs]
+  );
+  const selectedFileLines = useMemo(() => {
+    if (!activeEditorTab) {
+      return [];
+    }
+
+    return (activeEditorTab.isEditing ? activeEditorTab.draftContent : activeEditorTab.content).split("\n");
+  }, [activeEditorTab]);
 
   async function loadWorkspaceGithub(workspaceId: string) {
     setIsLoadingGithub(true);
@@ -727,7 +833,8 @@ export default function App() {
           connected: false,
           user: null,
           canManage: false,
-          repos: []
+          repos: [],
+          availableRepos: []
         }
       );
     } catch (error) {
@@ -754,9 +861,8 @@ export default function App() {
       const data = (await response.json()) as WorkspaceGitResponse;
       setWorkspaceGit(
         data.git ?? {
-          detected: false,
-          localRepoUrl: null,
-          localPath: null,
+          checkoutRoot: "",
+          canManage: false,
           repos: []
         }
       );
@@ -765,6 +871,120 @@ export default function App() {
       setGitError(error instanceof Error ? error.message : "Could not load Git workspace status.");
     } finally {
       setIsLoadingGit(false);
+    }
+  }
+
+  async function loadSessionFiles(sessionId: string, currentPath = "") {
+    setIsLoadingFiles(true);
+    setFileError(null);
+
+    try {
+      const query = currentPath ? `?path=${encodeURIComponent(currentPath)}` : "";
+      const response = await fetch(`${serverUrl.replace(/\/$/, "")}/sessions/${sessionId}/files${query}`, {
+        method: "GET",
+        credentials: "include"
+      });
+      if (!response.ok) {
+        throw new Error("Could not load session files.");
+      }
+
+      const data = (await response.json()) as { context?: SessionFileContext };
+      setSessionFiles(data.context ?? null);
+    } catch (error) {
+      setSessionFiles(null);
+      setFileError(error instanceof Error ? error.message : "Could not load session files.");
+    } finally {
+      setIsLoadingFiles(false);
+    }
+  }
+
+  async function loadSessionFile(sessionId: string, filePath: string) {
+    setIsLoadingFiles(true);
+    setFileError(null);
+
+    try {
+      const response = await fetch(
+        `${serverUrl.replace(/\/$/, "")}/sessions/${sessionId}/file?path=${encodeURIComponent(filePath)}`,
+        {
+          method: "GET",
+          credentials: "include"
+        }
+      );
+      if (!response.ok) {
+        throw new Error("Could not load file.");
+      }
+
+      const data = (await response.json()) as { context?: SessionFileContext };
+      const nextContext = data.context ?? null;
+      setSessionFiles(nextContext);
+      if (nextContext?.file) {
+        const nextTab: EditorTab = {
+          path: nextContext.file.path,
+          content: nextContext.file.content,
+          savedContent: nextContext.file.content,
+          draftContent: nextContext.file.content,
+          truncated: nextContext.file.truncated,
+          size: nextContext.file.size
+          ,
+          diffContent: nextContext.file.diff?.content ?? "",
+          hasDiff: nextContext.file.diff?.hasChanges ?? false,
+          isEditing: false,
+          isSaving: false
+        };
+
+        setOpenEditorTabs((current) => {
+          const existingIndex = current.findIndex((tab) => tab.path === nextTab.path);
+          if (existingIndex >= 0) {
+            const nextTabs = [...current];
+            nextTabs[existingIndex] = {
+              ...nextTabs[existingIndex],
+              ...nextTab,
+              draftContent: nextTabs[existingIndex].isEditing
+                ? nextTabs[existingIndex].draftContent
+                : nextTab.draftContent,
+              isEditing: nextTabs[existingIndex].isEditing,
+              isSaving: false
+            };
+            return nextTabs;
+          }
+
+          return [...current, nextTab];
+        });
+        setActiveCenterTab(nextTab.path);
+        setActiveEditorView("source");
+      }
+    } catch (error) {
+      setFileError(error instanceof Error ? error.message : "Could not load file.");
+    } finally {
+      setIsLoadingFiles(false);
+    }
+  }
+
+  async function loadWorkspaceTree() {
+    setWorkspaceTree([]);
+
+    try {
+      const response = await fetch(`${serverUrl.replace(/\/$/, "")}/workspaces/tree`, {
+        method: "GET",
+        credentials: "include"
+      });
+      if (!response.ok) {
+        return;
+      }
+
+      const data = (await response.json()) as WorkspaceTreeResponse;
+      const nextTree =
+        data.workspaces?.map((workspace) => ({
+          ...workspace,
+          sessions: workspace.sessions.map((session) => ({
+            ...session,
+            serverSessionId: session.id
+          }))
+        })) ?? [];
+
+      setWorkspaceTree(nextTree);
+    } catch {
+      return;
     }
   }
 
@@ -791,7 +1011,36 @@ export default function App() {
   useEffect(() => {
     setDraft("");
     setSendError(null);
+    setOpenEditorTabs([]);
+    setActiveCenterTab("chat");
+    setActiveEditorView("source");
   }, [selectedSessionId]);
+
+  useEffect(() => {
+    if (!selectedSession?.serverSessionId || !selectedSession.worktree) {
+      setSessionFiles(null);
+      setFileError(null);
+      setOpenEditorTabs([]);
+      setActiveCenterTab("chat");
+      setActiveEditorView("source");
+      setSelectedFileLineRange(null);
+      setLineSelectionAnchor(null);
+      return;
+    }
+
+    void loadSessionFiles(selectedSession.serverSessionId);
+  }, [selectedSession?.serverSessionId, selectedSession?.worktree?.path]);
+
+  useEffect(() => {
+    setSelectedFileLineRange(null);
+    setLineSelectionAnchor(null);
+  }, [activeEditorTab?.path]);
+
+  useEffect(() => {
+    if (activeCenterTab === "chat") {
+      setActiveEditorView("source");
+    }
+  }, [activeCenterTab]);
 
   useEffect(() => {
     const textarea = draftTextareaRef.current;
@@ -979,38 +1228,12 @@ export default function App() {
       return;
     }
 
-    async function loadWorkspaceTree() {
-      setWorkspaceTree([]);
-      try {
-        const response = await fetch(`${serverUrl.replace(/\/$/, "")}/workspaces/tree`, {
-          method: "GET",
-          credentials: "include"
-        });
-        if (!response.ok) {
-          return;
-        }
-
-        const data = (await response.json()) as WorkspaceTreeResponse;
-        const nextTree =
-          data.workspaces?.map((workspace) => ({
-            ...workspace,
-            sessions: workspace.sessions.map((session) => ({
-              ...session,
-              serverSessionId: session.id
-            }))
-          })) ?? [];
-
-        setWorkspaceTree(nextTree);
-      } catch {
-        return;
-      }
-    }
-
     void loadWorkspaceTree();
   }, [authUser, serverConfigLoaded, serverUrl]);
 
   useEffect(() => {
-    setGithubRepoUrl("");
+    setGithubRepoQuery("");
+    setSelectedGithubRepoUrl("");
     setGithubProjectName("");
     setGithubError(null);
     setGitError(null);
@@ -1115,6 +1338,240 @@ export default function App() {
 
   function toggleWorkspace(id: string) {
     setExpanded((prev) => ({ ...prev, [id]: !prev[id] }));
+  }
+
+  async function handleAssignSessionProject(projectId: string) {
+    if (!selectedSession?.serverSessionId) {
+      return;
+    }
+
+    setFileError(null);
+
+    try {
+      const response = await fetch(
+        `${serverUrl.replace(/\/$/, "")}/sessions/${selectedSession.serverSessionId}/project`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ projectId })
+        }
+      );
+      if (!response.ok) {
+        throw new Error("Could not attach project to session.");
+      }
+
+      const data = (await response.json()) as { session: SessionRecord };
+      setWorkspaceTree((current) =>
+        current.map((workspace) => ({
+          ...workspace,
+          sessions: workspace.sessions.map((session) =>
+            session.id === selectedSession.id
+              ? {
+                  ...session,
+                  ...data.session,
+                  serverSessionId: data.session.id
+                }
+              : session
+          )
+        }))
+      );
+      setSessionFiles(null);
+    } catch (error) {
+      setFileError(error instanceof Error ? error.message : "Could not attach project.");
+    }
+  }
+
+  async function handleCreateSessionWorktree() {
+    if (!selectedSession?.serverSessionId || !selectedSession.projectId) {
+      return;
+    }
+
+    setIsCreatingWorktree(true);
+    setFileError(null);
+
+    try {
+      const response = await fetch(
+        `${serverUrl.replace(/\/$/, "")}/sessions/${selectedSession.serverSessionId}/worktree`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ projectId: selectedSession.projectId })
+        }
+      );
+      if (!response.ok) {
+        const errorBody = (await response.json().catch(() => null)) as
+          | { message?: string; error?: string }
+          | null;
+        throw new Error(errorBody?.message ?? errorBody?.error ?? "Could not create session worktree.");
+      }
+
+      await Promise.all([
+        selectedWorkspace?.id ? loadWorkspaceGit(selectedWorkspace.id) : Promise.resolve(),
+        loadWorkspaceTree()
+      ]);
+
+      await loadSessionFiles(selectedSession.serverSessionId);
+    } catch (error) {
+      setFileError(error instanceof Error ? error.message : "Could not create session worktree.");
+    } finally {
+      setIsCreatingWorktree(false);
+    }
+  }
+
+  function handleSelectFileLine(lineNumber: number, extendSelection: boolean) {
+    if (!extendSelection || lineSelectionAnchor === null) {
+      setSelectedFileLineRange({ start: lineNumber, end: lineNumber });
+      setLineSelectionAnchor(lineNumber);
+      return;
+    }
+
+    setSelectedFileLineRange({
+      start: Math.min(lineSelectionAnchor, lineNumber),
+      end: Math.max(lineSelectionAnchor, lineNumber)
+    });
+  }
+
+  function handleAddSelectionToChat() {
+    if (!activeEditorTab || !selectedFileLineRange) {
+      return;
+    }
+
+    const startIndex = Math.max(0, selectedFileLineRange.start - 1);
+    const endIndex = Math.min(selectedFileLines.length, selectedFileLineRange.end);
+    const snippet = selectedFileLines.slice(startIndex, endIndex).join("\n");
+    const label =
+      selectedFileLineRange.start === selectedFileLineRange.end
+        ? `line ${selectedFileLineRange.start}`
+        : `lines ${selectedFileLineRange.start}-${selectedFileLineRange.end}`;
+    const nextSnippet = `Review ${activeEditorTab.path} ${label}:\n\`\`\`\n${snippet}\n\`\`\``;
+
+    setDraft((current) => (current.trim() ? `${current.trim()}\n\n${nextSnippet}` : nextSnippet));
+    draftTextareaRef.current?.focus();
+  }
+
+  function handleCloseEditorTab(path: string) {
+    setOpenEditorTabs((current) => {
+      const remainingTabs = current.filter((tab) => tab.path !== path);
+      setActiveCenterTab((currentActiveTab) => {
+        if (currentActiveTab !== path) {
+          return currentActiveTab;
+        }
+
+        return remainingTabs[remainingTabs.length - 1]?.path ?? "chat";
+      });
+      return remainingTabs;
+    });
+  }
+
+  function handleToggleEditorMode(isEditing: boolean) {
+    if (!activeEditorTab) {
+      return;
+    }
+
+    setOpenEditorTabs((current) =>
+      current.map((tab) =>
+        tab.path === activeEditorTab.path
+          ? {
+              ...tab,
+              isEditing,
+              draftContent: isEditing ? tab.draftContent : tab.savedContent
+            }
+          : tab
+      )
+    );
+    if (isEditing) {
+      setActiveEditorView("source");
+    }
+  }
+
+  function handleEditorDraftChange(nextValue: string) {
+    if (!activeEditorTab) {
+      return;
+    }
+
+    setOpenEditorTabs((current) =>
+      current.map((tab) =>
+        tab.path === activeEditorTab.path
+          ? {
+              ...tab,
+              draftContent: nextValue
+            }
+          : tab
+      )
+    );
+  }
+
+  async function handleSaveEditorTab() {
+    if (!selectedSession?.serverSessionId || !activeEditorTab) {
+      return;
+    }
+
+    setFileError(null);
+    setOpenEditorTabs((current) =>
+      current.map((tab) =>
+        tab.path === activeEditorTab.path
+          ? {
+              ...tab,
+              isSaving: true
+            }
+          : tab
+      )
+    );
+
+    try {
+      const response = await fetch(`${serverUrl.replace(/\/$/, "")}/sessions/${selectedSession.serverSessionId}/file`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          path: activeEditorTab.path,
+          content: activeEditorTab.draftContent
+        })
+      });
+      if (!response.ok) {
+        throw new Error("Could not save file.");
+      }
+
+      const data = (await response.json()) as { context?: SessionFileContext };
+      const nextFile = data.context?.file;
+      if (!nextFile) {
+        throw new Error("Saved file response was incomplete.");
+      }
+
+      setSessionFiles(data.context ?? null);
+      setOpenEditorTabs((current) =>
+        current.map((tab) =>
+          tab.path === nextFile.path
+            ? {
+                ...tab,
+                content: nextFile.content,
+                savedContent: nextFile.content,
+                draftContent: nextFile.content,
+                truncated: nextFile.truncated,
+                size: nextFile.size,
+                diffContent: nextFile.diff?.content ?? "",
+                hasDiff: nextFile.diff?.hasChanges ?? false,
+                isEditing: false,
+                isSaving: false
+              }
+            : tab
+        )
+      );
+    } catch (error) {
+      setFileError(error instanceof Error ? error.message : "Could not save file.");
+      setOpenEditorTabs((current) =>
+        current.map((tab) =>
+          tab.path === activeEditorTab.path
+            ? {
+                ...tab,
+                isSaving: false
+              }
+            : tab
+        )
+      );
+    }
   }
 
   async function handleCreateSession() {
@@ -1501,7 +1958,7 @@ export default function App() {
   }
 
   async function handleConnectGithub() {
-    if (!selectedWorkspace?.id || !githubRepoUrl.trim() || !workspaceGithub?.connected) {
+    if (!selectedWorkspace?.id || !selectedGithubRepoUrl || !workspaceGithub?.connected) {
       return;
     }
 
@@ -1516,14 +1973,14 @@ export default function App() {
           headers: { "Content-Type": "application/json" },
           credentials: "include",
           body: JSON.stringify({
-            repoUrl: githubRepoUrl.trim(),
+            repoUrl: selectedGithubRepoUrl,
             ...(githubProjectName.trim() ? { projectName: githubProjectName.trim() } : {})
           })
         }
       );
 
       const data = (await response.json().catch(() => null)) as
-        | { repo?: WorkspaceGithubRepo; message?: string; error?: string }
+        | { repo?: WorkspaceGithubRepo; syncError?: string | null; message?: string; error?: string }
         | null;
       if (!response.ok || !data?.repo) {
         throw new Error(data?.message ?? data?.error ?? "Could not connect GitHub repo.");
@@ -1544,11 +2001,16 @@ export default function App() {
           connected: current?.connected ?? true,
           user: current?.user ?? null,
           canManage: current?.canManage ?? true,
-          repos: nextRepos
+          repos: nextRepos,
+          availableRepos: current?.availableRepos ?? []
         };
       });
-      setGithubRepoUrl("");
+      setGithubRepoQuery("");
+      setSelectedGithubRepoUrl("");
       setGithubProjectName("");
+      if (data.syncError) {
+        setGitError(`Repo connected, but initial server sync failed: ${data.syncError}`);
+      }
       await loadWorkspaceGit(selectedWorkspace.id);
     } catch (error) {
       setGithubError(error instanceof Error ? error.message : "Could not connect GitHub repo.");
@@ -1835,62 +2297,257 @@ export default function App() {
             ) : null}
           </div>
 
-          <div
-            ref={chatScrollRef}
-            onScroll={handleChatScroll}
-            className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-6 py-5"
-          >
-            {selectedSession ? (
-              <div className="mx-auto flex max-w-4xl flex-col gap-4 pb-8">
-                {selectedSession.messages.map((message) => (
-                  <div
-                    key={message.id}
-                    className={`flex ${message.role === "user" ? "justify-end" : "justify-start"}`}
+          {selectedSession ? (
+            <>
+              <div className="border-b border-border px-6 pt-4">
+                <div className="flex items-center gap-2 overflow-x-auto pb-3">
+                  <button
+                    type="button"
+                    onClick={() => setActiveCenterTab("chat")}
+                    className={`rounded-t-xl border px-3 py-2 text-sm transition-colors ${
+                      activeCenterTab === "chat"
+                        ? "border-border border-b-background bg-background text-foreground"
+                        : "border-transparent bg-card/60 text-muted-foreground hover:bg-accent"
+                    }`}
                   >
+                    Chat
+                  </button>
+                  {openEditorTabs.map((tab) => (
                     <div
-                      className={`max-w-3xl rounded-3xl px-4 py-3 ${
-                        message.role === "user"
-                          ? "bg-primary text-primary-foreground"
-                          : "border border-border bg-card"
+                      key={tab.path}
+                      className={`flex items-center gap-2 rounded-t-xl border px-3 py-2 text-sm ${
+                        activeCenterTab === tab.path
+                          ? "border-border border-b-background bg-background text-foreground"
+                          : "border-transparent bg-card/60 text-muted-foreground"
                       }`}
                     >
-                      <div className="mb-2 flex items-center gap-2 text-[11px] uppercase tracking-[0.18em] opacity-70">
-                        <span>{message.role === "user" ? "You" : "Assistant"}</span>
-                        <span>{message.timestamp}</span>
+                      <button
+                        type="button"
+                        onClick={() => setActiveCenterTab(tab.path)}
+                        className="max-w-56 truncate text-left"
+                      >
+                        {tab.path.split("/").pop()}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleCloseEditorTab(tab.path)}
+                        className="text-xs text-muted-foreground hover:text-foreground"
+                        aria-label={`Close ${tab.path}`}
+                      >
+                        x
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {activeCenterTab === "chat" ? (
+                <div
+                  ref={chatScrollRef}
+                  onScroll={handleChatScroll}
+                  className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-6 py-5"
+                >
+                  <div className="mx-auto flex max-w-4xl flex-col gap-4 pb-8">
+                    {selectedSession.messages.map((message) => (
+                      <div
+                        key={message.id}
+                        className={`flex ${message.role === "user" ? "justify-end" : "justify-start"}`}
+                      >
+                        <div
+                          className={`max-w-3xl rounded-3xl px-4 py-3 ${
+                            message.role === "user"
+                              ? "bg-primary text-primary-foreground"
+                              : "border border-border bg-card"
+                          }`}
+                        >
+                          <div className="mb-2 flex items-center gap-2 text-[11px] uppercase tracking-[0.18em] opacity-70">
+                            <span>{message.role === "user" ? "You" : "Assistant"}</span>
+                            <span>{message.timestamp}</span>
+                          </div>
+                          <div className="space-y-3">
+                            {renderMessageContent(
+                              message.content,
+                              message.id,
+                              copiedCodeId,
+                              handleCopyCode
+                            )}
+                          </div>
+                        </div>
                       </div>
-                      <div className="space-y-3">
-                        {renderMessageContent(
-                          message.content,
-                          message.id,
-                          copiedCodeId,
-                          handleCopyCode
-                        )}
+                    ))}
+                    {isSending ? (
+                      <div className="flex justify-start">
+                        <div className="max-w-3xl rounded-3xl border border-border bg-card px-4 py-3 text-sm text-muted-foreground">
+                          Thinking with {activeProvider?.label ?? "agent"}...
+                        </div>
+                      </div>
+                    ) : null}
+                  </div>
+                </div>
+              ) : activeEditorTab ? (
+                <div className="min-h-0 flex-1 overflow-hidden px-6 py-5">
+                  <div className="mx-auto flex h-full max-w-5xl flex-col rounded-3xl border border-border bg-card/70">
+                    <div className="flex items-center justify-between gap-3 border-b border-border px-4 py-3">
+                      <div>
+                        <div className="font-medium text-foreground">{activeEditorTab.path}</div>
+                        <div className="mt-1 text-xs text-muted-foreground">
+                          {activeEditorView === "diff"
+                            ? activeEditorTab.hasDiff
+                              ? "Showing git diff for this file."
+                              : "No git diff for this file yet."
+                            : selectedFileLineRange
+                              ? selectedFileLineRange.start === selectedFileLineRange.end
+                                ? `Selected line ${selectedFileLineRange.start}`
+                                : `Selected lines ${selectedFileLineRange.start}-${selectedFileLineRange.end}`
+                              : activeEditorTab.isEditing
+                                ? "Manual edit mode is on."
+                                : "Click a line number to select it. Shift-click to extend the range."}
+                        </div>
+                      </div>
+                      <div className="flex items-center gap-2">
+                        <div className="flex items-center gap-1 rounded-lg border border-border bg-background/70 p-1">
+                          <button
+                            type="button"
+                            onClick={() => setActiveEditorView("source")}
+                            className={`rounded-md px-2 py-1 text-xs ${
+                              activeEditorView === "source"
+                                ? "bg-primary text-primary-foreground"
+                                : "text-muted-foreground"
+                            }`}
+                          >
+                            Source
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => setActiveEditorView("diff")}
+                            className={`rounded-md px-2 py-1 text-xs ${
+                              activeEditorView === "diff"
+                                ? "bg-primary text-primary-foreground"
+                                : "text-muted-foreground"
+                            }`}
+                          >
+                            Diff
+                          </button>
+                        </div>
+                        <div className="flex items-center gap-1 rounded-lg border border-border bg-background/70 p-1">
+                          <button
+                            type="button"
+                            onClick={() => handleToggleEditorMode(false)}
+                            className={`rounded-md px-2 py-1 text-xs ${
+                              !activeEditorTab.isEditing
+                                ? "bg-primary text-primary-foreground"
+                                : "text-muted-foreground"
+                            }`}
+                          >
+                            Read
+                          </button>
+                          <button
+                            type="button"
+                            onClick={() => handleToggleEditorMode(true)}
+                            className={`rounded-md px-2 py-1 text-xs ${
+                              activeEditorTab.isEditing
+                                ? "bg-primary text-primary-foreground"
+                                : "text-muted-foreground"
+                            }`}
+                          >
+                            Edit
+                          </button>
+                        </div>
+                        <div className="text-xs text-muted-foreground">
+                          {activeEditorTab.size} bytes
+                        </div>
+                        {activeEditorTab.isEditing ? (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            disabled={activeEditorTab.isSaving || activeEditorTab.draftContent === activeEditorTab.savedContent}
+                            onClick={handleSaveEditorTab}
+                          >
+                            {activeEditorTab.isSaving ? "Saving..." : "Save"}
+                          </Button>
+                        ) : null}
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          disabled={!selectedFileLineRange || activeEditorView === "diff"}
+                          onClick={handleAddSelectionToChat}
+                        >
+                          Add to chat
+                        </Button>
                       </div>
                     </div>
+                    {activeEditorView === "diff" ? (
+                      <div className="min-h-0 flex-1 overflow-auto">
+                        <pre className="min-w-max p-4 font-mono text-[12px] leading-6 text-foreground">
+                          {activeEditorTab.diffContent || "No changes yet."}
+                        </pre>
+                      </div>
+                    ) : activeEditorTab.isEditing ? (
+                      <div className="min-h-0 flex-1 overflow-auto p-4">
+                        <textarea
+                          value={activeEditorTab.draftContent}
+                          onChange={(event) => handleEditorDraftChange(event.target.value)}
+                          spellCheck={false}
+                          className="h-full min-h-full w-full resize-none rounded-2xl border border-border bg-background/60 p-4 font-mono text-[12px] leading-6 text-foreground outline-none"
+                        />
+                      </div>
+                    ) : (
+                      <div className="min-h-0 flex-1 overflow-auto">
+                        <div className="min-w-max font-mono text-[12px] leading-6">
+                          {selectedFileLines.map((line, index) => {
+                            const lineNumber = index + 1;
+                            const isSelected =
+                              selectedFileLineRange !== null &&
+                              lineNumber >= selectedFileLineRange.start &&
+                              lineNumber <= selectedFileLineRange.end;
+
+                            return (
+                              <div
+                                key={`${activeEditorTab.path}-${lineNumber}`}
+                                className={`grid grid-cols-[64px_minmax(0,1fr)] ${
+                                  isSelected ? "bg-primary/10" : "hover:bg-accent/30"
+                                }`}
+                              >
+                                <button
+                                  type="button"
+                                  className={`border-r border-border px-3 py-0.5 text-right text-[11px] ${
+                                    isSelected ? "text-foreground" : "text-muted-foreground"
+                                  }`}
+                                  onClick={(event) => handleSelectFileLine(lineNumber, event.shiftKey)}
+                                >
+                                  {lineNumber}
+                                </button>
+                                <div className="px-4 py-0.5 whitespace-pre">
+                                  {line || " "}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+                    {activeEditorTab.truncated ? (
+                      <div className="border-t border-border px-4 py-2 text-xs text-muted-foreground">
+                        Preview truncated.
+                      </div>
+                    ) : null}
                   </div>
-                ))}
-                {isSending ? (
-                  <div className="flex justify-start">
-                    <div className="max-w-3xl rounded-3xl border border-border bg-card px-4 py-3 text-sm text-muted-foreground">
-                      Thinking with {activeProvider?.label ?? "agent"}...
-                    </div>
-                  </div>
-                ) : null}
-              </div>
-            ) : (
-              <div className="mx-auto flex h-full max-w-3xl items-center justify-center">
-                <Card className="w-full border-dashed bg-card/50">
-                  <CardHeader>
-                    <CardTitle>Pick a workspace session</CardTitle>
-                    <CardDescription>
-                      The main panel turns into a normal AI conversation once a session is selected.
-                    </CardDescription>
-                  </CardHeader>
-                </Card>
-              </div>
-            )}
-          </div>
-          {selectedSession && !isNearLatest ? (
+                </div>
+              ) : null}
+            </>
+          ) : (
+            <div className="mx-auto flex h-full max-w-3xl items-center justify-center px-6">
+              <Card className="w-full border-dashed bg-card/50">
+                <CardHeader>
+                  <CardTitle>Pick a workspace session</CardTitle>
+                  <CardDescription>
+                    The main panel turns into a normal AI conversation once a session is selected.
+                  </CardDescription>
+                </CardHeader>
+              </Card>
+            </div>
+          )}
+          {selectedSession && activeCenterTab === "chat" && !isNearLatest ? (
             <div className="pointer-events-none absolute inset-x-0 bottom-36 flex justify-center px-6">
               <button
                 type="button"
@@ -2018,24 +2675,132 @@ export default function App() {
               <div className="space-y-3">
                 <Card>
                   <CardHeader>
-                    <CardTitle>Session context</CardTitle>
+                    <CardTitle>Session Files</CardTitle>
                     <CardDescription>
                       {selectedSession
-                        ? `${selectedSession.contextCount} items attached to this conversation.`
-                        : "Select a session to inspect its context bundle."}
+                        ? "Attach a synced repo to this session and create a dedicated worktree."
+                        : "Select a session to inspect server-managed files."}
                     </CardDescription>
                   </CardHeader>
                   {selectedSession ? (
-                    <CardContent className="space-y-2 text-xs text-muted-foreground">
-                      <div className="rounded-lg border border-border px-3 py-2">
-                        `apps/desktop/src/renderer/App.tsx`
-                      </div>
-                      <div className="rounded-lg border border-border px-3 py-2">
-                        `apps/server/src/routes/agents.ts`
-                      </div>
-                      <div className="rounded-lg border border-border px-3 py-2">
-                        `packages/agent/src/index.ts`
-                      </div>
+                    <CardContent className="space-y-3 text-xs text-muted-foreground">
+                      {syncedRepos.length > 0 ? (
+                        <div className="space-y-2">
+                          <div className="rounded-lg border border-border px-3 py-2">
+                            <div className="font-medium text-foreground">Project</div>
+                            <select
+                              value={selectedSession.projectId ?? ""}
+                              onChange={(event) => void handleAssignSessionProject(event.target.value)}
+                              className="mt-2 w-full rounded-md border border-border bg-background px-3 py-2 text-sm"
+                            >
+                              <option value="">Select a synced repo</option>
+                              {syncedRepos.map((repo) => (
+                                <option key={repo.projectId} value={repo.projectId}>
+                                  {repo.projectName} · {repo.repoName}
+                                </option>
+                              ))}
+                            </select>
+                            {selectedProjectRepo ? (
+                              <div className="mt-2 truncate">Base checkout: {selectedProjectRepo.serverSync.path}</div>
+                            ) : null}
+                          </div>
+
+                          <div className="rounded-lg border border-border px-3 py-2">
+                            <div className="flex items-center justify-between gap-2">
+                              <div>
+                                <div className="font-medium text-foreground">Session worktree</div>
+                                <div className="mt-1">
+                                  {selectedSession.worktree
+                                    ? `${selectedSession.worktree.branch} · ${selectedSession.worktree.path}`
+                                    : "No session worktree yet."}
+                                </div>
+                              </div>
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                onClick={handleCreateSessionWorktree}
+                                disabled={!selectedSession.projectId || isCreatingWorktree}
+                              >
+                                {isCreatingWorktree ? "Creating..." : selectedSession.worktree ? "Reset worktree" : "Create worktree"}
+                              </Button>
+                            </div>
+                          </div>
+
+                          {fileError ? <div className="text-destructive">{fileError}</div> : null}
+
+                          {sessionFiles?.worktree ? (
+                            <div className="space-y-2">
+                              <div className="rounded-lg border border-border px-3 py-2">
+                                <div className="flex items-center justify-between gap-2">
+                                  <div className="font-medium text-foreground">
+                                    {sessionFiles.currentPath || "/"}
+                                  </div>
+                                  {sessionFiles.currentPath ? (
+                                    <Button
+                                      size="sm"
+                                      variant="outline"
+                                      onClick={() => {
+                                        const parts = sessionFiles.currentPath.split("/").filter(Boolean);
+                                        parts.pop();
+                                        void loadSessionFiles(
+                                          selectedSession.serverSessionId ?? selectedSession.id,
+                                          parts.join("/")
+                                        );
+                                      }}
+                                    >
+                                      Up
+                                    </Button>
+                                  ) : null}
+                                </div>
+                                <div className="mt-2 space-y-1">
+                                  {isLoadingFiles ? (
+                                    <div>Loading files...</div>
+                                  ) : sessionFiles.entries.length > 0 ? (
+                                    sessionFiles.entries.map((entry) => (
+                                      <button
+                                        key={entry.path}
+                                        type="button"
+                                        className="flex w-full items-center justify-between rounded-md border border-border px-2 py-2 text-left hover:bg-accent"
+                                        onClick={() =>
+                                          entry.type === "directory"
+                                            ? void loadSessionFiles(
+                                                selectedSession.serverSessionId ?? selectedSession.id,
+                                                entry.path
+                                              )
+                                            : void loadSessionFile(
+                                                selectedSession.serverSessionId ?? selectedSession.id,
+                                                entry.path
+                                              )
+                                        }
+                                      >
+                                        <span>
+                                          {entry.type === "directory" ? "Dir" : "File"} · {entry.name}
+                                        </span>
+                                        <span>{entry.type === "file" ? `${entry.size ?? 0} bytes` : ""}</span>
+                                      </button>
+                                    ))
+                                  ) : (
+                                    <div>No files in this directory.</div>
+                                  )}
+                                </div>
+                              </div>
+                              {activeEditorTab ? (
+                                <div className="rounded-lg border border-border px-3 py-2 text-[11px] text-muted-foreground">
+                                  Open in center panel: <span className="text-foreground">{activeEditorTab.path}</span>
+                                </div>
+                              ) : null}
+                            </div>
+                          ) : (
+                            <div className="rounded-lg border border-dashed border-border px-3 py-2">
+                              Create a session worktree to browse files and attach repo context.
+                            </div>
+                          )}
+                        </div>
+                      ) : (
+                        <div className="rounded-lg border border-dashed border-border px-3 py-2">
+                          Sync a repo to the server first, then attach it to this session.
+                        </div>
+                      )}
                     </CardContent>
                   ) : null}
                 </Card>
@@ -2127,7 +2892,7 @@ export default function App() {
                 <Card>
                   <CardHeader>
                     <CardTitle>GitHub</CardTitle>
-                    <CardDescription>Connect your GitHub account, then attach workspace repos.</CardDescription>
+                    <CardDescription>Workspace owners can select a GitHub repo for this workspace.</CardDescription>
                   </CardHeader>
                   <CardContent className="space-y-3">
                     <div className="rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground">
@@ -2252,15 +3017,37 @@ export default function App() {
                     {workspaceGithub?.canManage ? (
                       <div className="space-y-2">
                         <input
-                          value={githubRepoUrl}
-                          onChange={(event) => setGithubRepoUrl(event.target.value)}
-                          placeholder="https://github.com/owner/repo"
+                          value={githubRepoQuery}
+                          onChange={(event) => setGithubRepoQuery(event.target.value)}
+                          placeholder="Search repos by owner/name"
                           className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none transition focus:border-foreground/30"
                         />
+                        <select
+                          value={selectedGithubRepoUrl}
+                          onChange={(event) => {
+                            const value = event.target.value;
+                            setSelectedGithubRepoUrl(value);
+                            const selectedRepo = (workspaceGithub.availableRepos ?? []).find(
+                              (repo) => repo.repoUrl === value
+                            );
+                            setGithubProjectName(selectedRepo?.name ?? "");
+                          }}
+                          className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none transition focus:border-foreground/30"
+                        >
+                          <option value="">
+                            {filteredAvailableGithubRepos.length > 0 ? "Select a GitHub repo" : "No repos found"}
+                          </option>
+                          {filteredAvailableGithubRepos.map((repo) => (
+                            <option key={repo.repoUrl} value={repo.repoUrl}>
+                              {repo.fullName}
+                              {repo.private ? " (private)" : ""}
+                            </option>
+                          ))}
+                        </select>
                         <input
                           value={githubProjectName}
                           onChange={(event) => setGithubProjectName(event.target.value)}
-                          placeholder="Project name (optional)"
+                          placeholder="Workspace project name"
                           className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none transition focus:border-foreground/30"
                         />
                         <Button
@@ -2270,7 +3057,7 @@ export default function App() {
                           onClick={handleConnectGithub}
                           disabled={
                             isConnectingGithub ||
-                            !githubRepoUrl.trim() ||
+                            !selectedGithubRepoUrl ||
                             !workspaceGithub.connected ||
                             githubAuth.inProgress
                           }
@@ -2280,20 +3067,25 @@ export default function App() {
                       </div>
                     ) : workspaceGithub && !isLoadingGithub ? (
                       <div className="rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground">
-                        Viewer access only. Ask an owner or maintainer to connect a repo.
+                        Repo selection is owner-only. Ask the workspace owner to connect a repo.
                       </div>
                     ) : null}
                   </CardContent>
                 </Card>
                 <Card>
                   <CardHeader>
-                    <CardTitle>Git</CardTitle>
-                    <CardDescription>Local repo state for the workspace checkout on this machine.</CardDescription>
+                    <CardTitle>Server checkouts</CardTitle>
+                    <CardDescription>Repos synced onto the HawkCode server for schedules and agents.</CardDescription>
                   </CardHeader>
                   <CardContent className="space-y-3">
+                    {workspaceGit?.checkoutRoot ? (
+                      <div className="rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground">
+                        Checkout root: {workspaceGit.checkoutRoot}
+                      </div>
+                    ) : null}
                     {isLoadingGit ? (
                       <div className="rounded-lg border border-dashed border-border px-3 py-2 text-xs text-muted-foreground">
-                        Loading Git status...
+                        Loading server checkout status...
                       </div>
                     ) : workspaceGit?.repos.length ? (
                       <div className="space-y-2">
@@ -2304,7 +3096,13 @@ export default function App() {
                           >
                             <div className="flex items-center justify-between gap-3">
                               <span className="font-medium text-foreground">{repo.repoName}</span>
-                              <span>{repo.local ? "Local checkout matched" : "Remote only"}</span>
+                              <span>
+                                {repo.serverSync.status === "ready"
+                                  ? "Synced"
+                                  : repo.serverSync.status === "error"
+                                    ? "Needs attention"
+                                    : "Not synced"}
+                              </span>
                             </div>
                             <button
                               type="button"
@@ -2313,24 +3111,39 @@ export default function App() {
                             >
                               {repo.repoUrl}
                             </button>
-                            {repo.local ? (
+                            {repo.serverSync.status === "ready" ? (
                               <div className="mt-2 space-y-1">
                                 <div>
-                                  Branch `{repo.local.branch}` · {repo.local.clean ? "Clean" : "Dirty"}
-                                  {repo.local.ahead || repo.local.behind
-                                    ? ` · ahead ${repo.local.ahead} / behind ${repo.local.behind}`
+                                  Branch `{repo.serverSync.branch}` ·{" "}
+                                  {repo.serverSync.clean ? "Clean" : "Dirty"}
+                                  {repo.serverSync.ahead || repo.serverSync.behind
+                                    ? ` · ahead ${repo.serverSync.ahead} / behind ${repo.serverSync.behind}`
                                     : ""}
                                 </div>
                                 <div>
-                                  {repo.local.changedFiles} changed · {repo.local.stagedFiles} staged ·{" "}
-                                  {repo.local.modifiedFiles} modified · {repo.local.untrackedFiles} untracked
+                                  {repo.serverSync.changedFiles} changed · {repo.serverSync.stagedFiles} staged ·{" "}
+                                  {repo.serverSync.modifiedFiles} modified · {repo.serverSync.untrackedFiles} untracked
                                 </div>
-                                <div className="truncate">Path: {repo.local.path}</div>
-                                <div>
-                                  Last commit {repo.local.lastCommit.shortSha} · {repo.local.lastCommit.subject}
-                                </div>
+                                <div className="truncate">Path: {repo.serverSync.path}</div>
+                                {repo.serverSync.lastSyncedAt ? (
+                                  <div>Last synced {formatTimestamp(repo.serverSync.lastSyncedAt)}</div>
+                                ) : null}
+                                {repo.serverSync.lastCommit ? (
+                                  <div>
+                                    Last commit {repo.serverSync.lastCommit.shortSha} · {repo.serverSync.lastCommit.subject}
+                                  </div>
+                                ) : null}
                               </div>
-                            ) : null}
+                            ) : repo.serverSync.status === "error" ? (
+                              <div className="mt-2 space-y-1 text-destructive">
+                                <div>Server checkout is unavailable.</div>
+                                {repo.serverSync.error ? <div className="text-xs">{repo.serverSync.error}</div> : null}
+                              </div>
+                            ) : (
+                              <div className="mt-2 text-xs text-muted-foreground">
+                                This repo is connected, but the server has not synced files yet.
+                              </div>
+                            )}
                           </div>
                         ))}
                       </div>
@@ -2339,11 +3152,6 @@ export default function App() {
                         No Git repos connected for this workspace yet.
                       </div>
                     )}
-                    {workspaceGit && !workspaceGit.detected ? (
-                      <div className="rounded-lg border border-dashed border-border px-3 py-2 text-xs text-muted-foreground">
-                        No local Git checkout detected from the running server workspace.
-                      </div>
-                    ) : null}
                     {gitError ? <div className="text-xs text-destructive">{gitError}</div> : null}
                     <Button
                       size="sm"
@@ -2352,14 +3160,14 @@ export default function App() {
                       onClick={() => selectedWorkspace?.id && void loadWorkspaceGit(selectedWorkspace.id)}
                       disabled={isLoadingGit || !selectedWorkspace?.id}
                     >
-                      {isLoadingGit ? "Refreshing..." : "Refresh Git status"}
+                      {isLoadingGit ? "Refreshing..." : "Refresh server status"}
                     </Button>
                   </CardContent>
                 </Card>
                 <Card>
                   <CardHeader>
-                    <CardTitle>Local tools</CardTitle>
-                    <CardDescription>Shell, tests, and file context.</CardDescription>
+                    <CardTitle>Server tools</CardTitle>
+                    <CardDescription>Workspace automation now runs from the server checkout.</CardDescription>
                   </CardHeader>
                   <CardContent className="space-y-2">
                     <Button size="sm" variant="outline" className="w-full justify-start">

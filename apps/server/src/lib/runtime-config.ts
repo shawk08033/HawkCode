@@ -5,6 +5,7 @@ import { z } from "zod";
 const configSchema = z.object({
   databaseUrl: z.string().min(1),
   dbProvider: z.enum(["postgresql", "sqlite"]),
+  serverCheckoutRoot: z.string().optional(),
   redisUrl: z.string().optional(),
   githubClientId: z.string().optional(),
   githubAppId: z.string().optional(),
@@ -52,6 +53,10 @@ export function resolveConfigPath() {
   }
 }
 
+export function resolveConfigBaseDir() {
+  return path.dirname(resolveConfigPath());
+}
+
 export function loadRuntimeConfig(): RuntimeConfig | null {
   const configPath = resolveConfigPath();
   if (!fs.existsSync(configPath)) {
@@ -67,6 +72,7 @@ export function loadRuntimeConfig(): RuntimeConfig | null {
   };
   return {
     ...config,
+    serverCheckoutRoot: resolveMaybe(config.serverCheckoutRoot),
     githubAppKeyPath: resolveMaybe(config.githubAppKeyPath),
     tlsCertPath: resolveMaybe(config.tlsCertPath),
     tlsKeyPath: resolveMaybe(config.tlsKeyPath)

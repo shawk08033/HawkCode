@@ -54,6 +54,7 @@ async function promptForConfig(nonInteractive: boolean) {
       workspaceName: cleanValue(getEnvValue("HAWKCODE_WORKSPACE_NAME")),
       dbProvider: (getEnvValue("DATABASE_PROVIDER") ?? "postgresql"),
       databaseUrl: cleanValue(getEnvValue("DATABASE_URL")),
+      serverCheckoutRoot: cleanValue(getEnvValue("HAWKCODE_SERVER_CHECKOUT_ROOT")),
       redisUrl: cleanValue(getEnvValue("REDIS_URL")),
       githubClientId: cleanValue(getEnvValue("GITHUB_CLIENT_ID")),
       githubAppId: cleanValue(getEnvValue("GITHUB_APP_ID")),
@@ -102,6 +103,12 @@ async function promptForConfig(nonInteractive: boolean) {
       name: "databaseUrl",
       message: "Database URL",
       initial: getEnvValue("DATABASE_URL") ?? "postgresql://user:pass@localhost:5432/hawkcode"
+    },
+    {
+      type: "text",
+      name: "serverCheckoutRoot",
+      message: "Server checkout root (optional)",
+      initial: getEnvValue("HAWKCODE_SERVER_CHECKOUT_ROOT") ?? ".hawkcode/checkouts"
     },
     {
       type: "text",
@@ -183,6 +190,7 @@ async function promptForConfig(nonInteractive: boolean) {
     adminPassword: cleanValue(response.adminPassword),
     workspaceName: cleanValue(response.workspaceName),
     databaseUrl: cleanValue(response.databaseUrl),
+    serverCheckoutRoot: cleanValue(response.serverCheckoutRoot),
     redisUrl: cleanValue(response.redisUrl),
     githubClientId: cleanValue(response.githubClientId),
     githubAppId: cleanValue(response.githubAppId),

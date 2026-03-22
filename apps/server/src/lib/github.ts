@@ -31,6 +31,10 @@ type GitHubRepoResponse = {
   full_name: string;
   html_url: string;
   name: string;
+  private: boolean;
+  owner: {
+    login: string;
+  };
 };
 
 function getConfiguredGitHubClientId() {
@@ -176,4 +180,31 @@ export async function fetchGitHubRepo(accessToken: string, owner: string, repo: 
     htmlUrl: data.html_url,
     name: data.name
   };
+}
+
+export async function listGitHubRepos(accessToken: string) {
+  const response = await fetch(
+    "https://api.github.com/user/repos?sort=updated&per_page=100&affiliation=owner,collaborator,organization_member",
+    {
+      method: "GET",
+      headers: {
+        Accept: "application/vnd.github+json",
+        Authorization: `Bearer ${accessToken}`,
+        "User-Agent": "HawkCode"
+      }
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(response.status === 401 ? "github_token_invalid" : "github_repo_list_failed");
+  }
+
+  const data = await parseJsonResponse<GitHubRepoResponse[]>(response);
+  return data.map((repo) => ({
+    name: repo.name,
+    fullName: repo.full_name,
+    htmlUrl: repo.html_url,
+    private: repo.private,
+    ownerLogin: repo.owner.login
+  }));
 }

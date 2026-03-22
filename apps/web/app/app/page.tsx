@@ -29,11 +29,18 @@ type SessionRecord = {
   id: string;
   serverSessionId?: string;
   title: string;
+  projectId?: string | null;
+  projectName?: string | null;
   updated: string;
   model: string;
   branch: string;
   status: string;
   contextCount: number;
+  worktree?: {
+    path: string;
+    branch: string;
+    createdAt: string;
+  } | null;
   messages: ChatMessage[];
 };
 
@@ -64,12 +71,21 @@ type GitHubUserRecord = {
   connectedAt: string;
 };
 
+type AvailableGitHubRepo = {
+  name: string;
+  fullName: string;
+  repoUrl: string;
+  private: boolean;
+  ownerLogin: string;
+};
+
 type WorkspaceGithubState = {
   authConfigured: boolean;
   connected: boolean;
   user: GitHubUserRecord | null;
   canManage: boolean;
   repos: WorkspaceGithubRepo[];
+  availableRepos: AvailableGitHubRepo[];
 };
 
 type AgentReplyResponse = {
@@ -94,37 +110,66 @@ type WorkspaceGithubResponse = {
 };
 
 type WorkspaceGitLocalState = {
-  path: string;
-  branch: string;
-  clean: boolean;
-  changedFiles: number;
-  stagedFiles: number;
-  modifiedFiles: number;
-  deletedFiles: number;
-  untrackedFiles: number;
-  ahead: number;
-  behind: number;
+  path: string | null;
+  branch: string | null;
+  lastSyncedAt: string | null;
+  clean: boolean | null;
+  changedFiles: number | null;
+  stagedFiles: number | null;
+  modifiedFiles: number | null;
+  deletedFiles: number | null;
+  untrackedFiles: number | null;
+  ahead: number | null;
+  behind: number | null;
+  error: string | null;
   lastCommit: {
     sha: string;
     shortSha: string;
     subject: string;
     committedAt: string;
-  };
+  } | null;
+  status: "ready" | "missing" | "error";
 };
 
 type WorkspaceGitRepo = WorkspaceGithubRepo & {
-  local: WorkspaceGitLocalState | null;
+  serverSync: WorkspaceGitLocalState;
 };
 
 type WorkspaceGitState = {
-  detected: boolean;
-  localRepoUrl: string | null;
-  localPath: string | null;
+  checkoutRoot: string;
+  canManage: boolean;
   repos: WorkspaceGitRepo[];
 };
 
 type WorkspaceGitResponse = {
   git?: WorkspaceGitState;
+};
+
+type SessionFileEntry = {
+  name: string;
+  path: string;
+  type: "directory" | "file";
+  size: number | null;
+};
+
+type SessionFileContext = {
+  sessionId: string;
+  projectId: string | null;
+  projectName: string | null;
+  currentPath: string;
+  worktree: {
+    id: string;
+    path: string;
+    branch: string;
+    createdAt: string;
+  } | null;
+  entries: SessionFileEntry[];
+  file: {
+    path: string;
+    content: string;
+    truncated: boolean;
+    size: number;
+  } | null;
 };
 
 type GitHubDeviceStartResponse = {
@@ -176,105 +221,6 @@ function formatTimestamp(value?: string) {
   });
 }
 
-function createInitialWorkspaces(): WorkspaceRecord[] {
-  return [
-    {
-      id: "ws-1",
-      name: "HawkCode",
-      sessions: [
-        {
-          id: "sess-1",
-          title: "Auth + invites",
-          updated: "2m ago",
-          model: "Codex",
-          branch: "feature/desktop-chat-ui",
-          status: "Live",
-          contextCount: 6,
-          messages: [
-            {
-              id: "m-1",
-              role: "user",
-              content:
-                "Review the invite acceptance flow and tell me where the workspace UI still feels rough.",
-              timestamp: "9:14 AM"
-            },
-            {
-              id: "m-2",
-              role: "assistant",
-              content:
-                "The biggest gap is that session state, context, and actions are split across views. Pulling them into a standard chat layout makes the workflow easier to understand.",
-              timestamp: "9:15 AM"
-            }
-          ]
-        },
-        {
-          id: "sess-2",
-          title: "Desktop onboarding",
-          updated: "40m ago",
-          model: "OpenRouter",
-          branch: "desktop-app-init",
-          status: "Waiting",
-          contextCount: 4,
-          messages: [
-            {
-              id: "m-5",
-              role: "user",
-              content: "Draft a cleaner first-run experience for connecting a workstation to HawkCode.",
-              timestamp: "8:36 AM"
-            },
-            {
-              id: "m-6",
-              role: "assistant",
-              content:
-                "Use a short connection stepper: server URL, trust decision, sign-in, then workspace selection. That keeps the flow understandable and reduces dead-end states.",
-              timestamp: "8:37 AM"
-            }
-          ]
-        }
-      ],
-      schedules: [
-        { id: "sch-1", title: "Nightly test run" },
-        { id: "sch-2", title: "Morning standup summary" }
-      ]
-    },
-    {
-      id: "ws-2",
-      name: "Internal Tools",
-      sessions: [
-        {
-          id: "sess-3",
-          title: "Cron runner",
-          updated: "1d ago",
-          model: "Codex",
-          branch: "main",
-          status: "Idle",
-          contextCount: 3,
-          messages: [
-            {
-              id: "m-7",
-              role: "user",
-              content: "Map out how scheduled prompts should surface run history and failures.",
-              timestamp: "Yesterday"
-            },
-            {
-              id: "m-8",
-              role: "assistant",
-              content:
-                "Show the last run status directly in the workspace tree, then keep full logs and retry actions in a side panel so the main view stays focused on the conversation.",
-              timestamp: "Yesterday"
-            }
-          ]
-        }
-      ],
-      schedules: [{ id: "sch-3", title: "Dependency audit" }]
-    }
-  ];
-}
-
-function isPlaceholderWorkspaceId(workspaceId?: string | null) {
-  return Boolean(workspaceId && /^ws-\d+$/.test(workspaceId));
-}
-
 function preferProvider(providers: ProviderInfo[]) {
   return providers.find((provider) => provider.name === "codex") ?? providers[0] ?? null;
 }
@@ -284,11 +230,9 @@ export default function AppHome() {
   const [user, setUser] = useState<User | null>(null);
   const [isAdmin, setIsAdmin] = useState(false);
   const [draft, setDraft] = useState("");
-  const [workspaceTree, setWorkspaceTree] = useState<WorkspaceRecord[]>(createInitialWorkspaces);
-  const [expanded, setExpanded] = useState<Record<string, boolean>>({
-    "ws-1": true,
-    "ws-2": false
-  });
+  const [workspaceTree, setWorkspaceTree] = useState<WorkspaceRecord[]>([]);
+  const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [selectedWorkspaceId, setSelectedWorkspaceId] = useState<string | null>(null);
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
   const [providers, setProviders] = useState<ProviderInfo[]>([]);
   const [selectedProvider, setSelectedProvider] = useState<"codex" | "openrouter" | null>(null);
@@ -298,14 +242,15 @@ export default function AppHome() {
   const [workspaceGit, setWorkspaceGit] = useState<WorkspaceGitState | null>(null);
   const [isLoadingGithub, setIsLoadingGithub] = useState(false);
   const [isLoadingGit, setIsLoadingGit] = useState(false);
-  const [isConnectingGithub, setIsConnectingGithub] = useState(false);
+  const [isLoadingFiles, setIsLoadingFiles] = useState(false);
+  const [isCreatingWorktree, setIsCreatingWorktree] = useState(false);
   const [githubError, setGithubError] = useState<string | null>(null);
   const [gitError, setGitError] = useState<string | null>(null);
-  const [githubRepoUrl, setGithubRepoUrl] = useState("");
-  const [githubProjectName, setGithubProjectName] = useState("");
+  const [fileError, setFileError] = useState<string | null>(null);
   const [githubAuth, setGithubAuth] = useState<GitHubAuthState>({
     inProgress: false
   });
+  const [sessionFiles, setSessionFiles] = useState<SessionFileContext | null>(null);
 
   const allSessions = useMemo(
     () => workspaceTree.flatMap((workspace) => workspace.sessions),
@@ -316,15 +261,51 @@ export default function AppHome() {
     [allSessions, selectedSessionId]
   );
   const selectedWorkspace = useMemo(
-    () =>
-      workspaceTree.find((workspace) =>
-        workspace.sessions.some((session) => session.id === selectedSessionId)
-      ) ?? workspaceTree[0],
-    [selectedSessionId, workspaceTree]
+    () => {
+      const explicitWorkspace =
+        workspaceTree.find((workspace) => workspace.id === selectedWorkspaceId) ?? null;
+      if (explicitWorkspace) {
+        return explicitWorkspace;
+      }
+
+      return (
+        workspaceTree.find((workspace) =>
+          workspace.sessions.some((session) => session.id === selectedSessionId)
+        ) ?? workspaceTree[0]
+      );
+    },
+    [selectedSessionId, selectedWorkspaceId, workspaceTree]
   );
+  const syncedRepos = useMemo(
+    () => workspaceGit?.repos.filter((repo) => repo.serverSync.status === "ready") ?? [],
+    [workspaceGit]
+  );
+  const recentActivity = useMemo(() => {
+    const events: Array<{ id: string; label: string }> = [];
+
+    if (selectedSession) {
+      events.push({
+        id: `session-${selectedSession.id}`,
+        label: `${selectedSession.updated} · Session ${selectedSession.title}`
+      });
+    }
+
+    for (const repo of workspaceGit?.repos ?? []) {
+      if (repo.serverSync.lastSyncedAt) {
+        events.push({
+          id: `repo-${repo.id}`,
+          label: `${formatTimestamp(repo.serverSync.lastSyncedAt)} · ${repo.projectName} synced to server`
+        });
+      }
+    }
+
+    return events.slice(0, 4);
+  }, [selectedSession, workspaceGit]);
   const activeProvider =
     providers.find((provider) => provider.name === selectedProvider) ??
     preferProvider(providers);
+  const selectedProjectRepo =
+    syncedRepos.find((repo) => repo.projectId === selectedSession?.projectId) ?? null;
 
   async function loadWorkspaceGithub(workspaceId: string) {
     setIsLoadingGithub(true);
@@ -346,7 +327,8 @@ export default function AppHome() {
           connected: false,
           user: null,
           canManage: false,
-          repos: []
+          repos: [],
+          availableRepos: []
         }
       );
     } catch (error) {
@@ -373,9 +355,8 @@ export default function AppHome() {
       const data = (await response.json()) as WorkspaceGitResponse;
       setWorkspaceGit(
         data.git ?? {
-          detected: false,
-          localRepoUrl: null,
-          localPath: null,
+          checkoutRoot: "",
+          canManage: false,
           repos: []
         }
       );
@@ -384,6 +365,58 @@ export default function AppHome() {
       setGitError(error instanceof Error ? error.message : "Could not load Git workspace status.");
     } finally {
       setIsLoadingGit(false);
+    }
+  }
+
+  async function loadSessionFiles(sessionId: string, currentPath = "") {
+    setIsLoadingFiles(true);
+    setFileError(null);
+
+    try {
+      const query = currentPath ? `?path=${encodeURIComponent(currentPath)}` : "";
+      const response = await fetch(
+        `${serverUrl.replace(/\/$/, "")}/sessions/${sessionId}/files${query}`,
+        {
+          method: "GET",
+          credentials: "include"
+        }
+      );
+      if (!response.ok) {
+        throw new Error("Could not load session files.");
+      }
+
+      const data = (await response.json()) as { context?: SessionFileContext };
+      setSessionFiles(data.context ?? null);
+    } catch (error) {
+      setSessionFiles(null);
+      setFileError(error instanceof Error ? error.message : "Could not load session files.");
+    } finally {
+      setIsLoadingFiles(false);
+    }
+  }
+
+  async function loadSessionFile(sessionId: string, filePath: string) {
+    setIsLoadingFiles(true);
+    setFileError(null);
+
+    try {
+      const response = await fetch(
+        `${serverUrl.replace(/\/$/, "")}/sessions/${sessionId}/file?path=${encodeURIComponent(filePath)}`,
+        {
+          method: "GET",
+          credentials: "include"
+        }
+      );
+      if (!response.ok) {
+        throw new Error("Could not load file.");
+      }
+
+      const data = (await response.json()) as { context?: SessionFileContext };
+      setSessionFiles(data.context ?? null);
+    } catch (error) {
+      setFileError(error instanceof Error ? error.message : "Could not load file.");
+    } finally {
+      setIsLoadingFiles(false);
     }
   }
 
@@ -415,6 +448,28 @@ export default function AppHome() {
   }, [expanded]);
 
   useEffect(() => {
+    if (workspaceTree.length === 0 || Object.keys(expanded).length > 0) {
+      return;
+    }
+
+    setExpanded({
+      [workspaceTree[0].id]: true
+    });
+  }, [expanded, workspaceTree]);
+
+  useEffect(() => {
+    if (!selectedWorkspaceId && workspaceTree.length > 0) {
+      setSelectedWorkspaceId(workspaceTree[0].id);
+    }
+    if (
+      selectedWorkspaceId &&
+      !workspaceTree.some((workspace) => workspace.id === selectedWorkspaceId)
+    ) {
+      setSelectedWorkspaceId(workspaceTree[0]?.id ?? null);
+    }
+  }, [selectedWorkspaceId, workspaceTree]);
+
+  useEffect(() => {
     if (!selectedSessionId && allSessions.length > 0) {
       setSelectedSessionId(allSessions[0].id);
     }
@@ -424,9 +479,38 @@ export default function AppHome() {
   }, [selectedSessionId, allSessions]);
 
   useEffect(() => {
+    if (!selectedSessionId) {
+      return;
+    }
+
+    const parentWorkspace = workspaceTree.find((workspace) =>
+      workspace.sessions.some((session) => session.id === selectedSessionId)
+    );
+    if (parentWorkspace) {
+      setSelectedWorkspaceId(parentWorkspace.id);
+    }
+  }, [selectedSessionId, workspaceTree]);
+
+  useEffect(() => {
     setDraft("");
     setSendError(null);
   }, [selectedSessionId]);
+
+  useEffect(() => {
+    if (!selectedSession?.serverSessionId) {
+      setSessionFiles(null);
+      setFileError(null);
+      return;
+    }
+
+    if (!selectedSession.worktree) {
+      setSessionFiles(null);
+      setFileError(null);
+      return;
+    }
+
+    void loadSessionFiles(selectedSession.serverSessionId);
+  }, [selectedSession?.serverSessionId, selectedSession?.worktree?.path]);
 
   useEffect(() => {
     if (!serverUrl) return;
@@ -535,8 +619,6 @@ export default function AppHome() {
   }, [serverUrl, user]);
 
   useEffect(() => {
-    setGithubRepoUrl("");
-    setGithubProjectName("");
     setGithubError(null);
     setGitError(null);
     setGithubAuth({
@@ -545,7 +627,7 @@ export default function AppHome() {
   }, [selectedWorkspace?.id]);
 
   useEffect(() => {
-    if (!user || !selectedWorkspace?.id || isPlaceholderWorkspaceId(selectedWorkspace.id)) {
+    if (!user || !selectedWorkspace?.id) {
       setWorkspaceGithub(null);
       setIsLoadingGithub(false);
       setGithubError(null);
@@ -556,7 +638,7 @@ export default function AppHome() {
   }, [serverUrl, user, selectedWorkspace?.id]);
 
   useEffect(() => {
-    if (!user || !selectedWorkspace?.id || isPlaceholderWorkspaceId(selectedWorkspace.id)) {
+    if (!user || !selectedWorkspace?.id) {
       setWorkspaceGit(null);
       setIsLoadingGit(false);
       setGitError(null);
@@ -576,6 +658,11 @@ export default function AppHome() {
 
   function toggleWorkspace(id: string) {
     setExpanded((prev) => ({ ...prev, [id]: !prev[id] }));
+  }
+
+  function handleSelectWorkspace(workspaceId: string) {
+    setSelectedWorkspaceId(workspaceId);
+    setExpanded((prev) => ({ ...prev, [workspaceId]: true }));
   }
 
   async function handleCreateSession() {
@@ -857,60 +944,148 @@ export default function AppHome() {
     }
   }
 
-  async function handleConnectGithub() {
-    if (!selectedWorkspace?.id || !githubRepoUrl.trim() || !workspaceGithub?.connected) {
+  async function handleSyncProject(projectId: string) {
+    if (!selectedWorkspace?.id) {
       return;
     }
 
-    setIsConnectingGithub(true);
-    setGithubError(null);
+    setIsLoadingGit(true);
+    setGitError(null);
 
     try {
       const response = await fetch(
-        `${serverUrl.replace(/\/$/, "")}/workspaces/${selectedWorkspace.id}/github/connect`,
+        `${serverUrl.replace(/\/$/, "")}/workspaces/${selectedWorkspace.id}/projects/${projectId}/sync`,
+        {
+          method: "POST",
+          credentials: "include"
+        }
+      );
+
+      const data = (await response.json().catch(() => null)) as
+        | { repo?: WorkspaceGitRepo; message?: string; error?: string }
+        | null;
+      if (!response.ok || !data?.repo) {
+        throw new Error(data?.message ?? data?.error ?? "Could not sync server checkout.");
+      }
+
+      setWorkspaceGit((current) => {
+        if (!current) {
+          return current;
+        }
+
+        return {
+          ...current,
+          repos: current.repos.map((repo) => (repo.projectId === projectId ? data.repo! : repo))
+        };
+      });
+    } catch (error) {
+      setGitError(error instanceof Error ? error.message : "Could not sync server checkout.");
+    } finally {
+      setIsLoadingGit(false);
+    }
+  }
+
+  async function handleAssignSessionProject(projectId: string) {
+    if (!selectedSession?.serverSessionId) {
+      return;
+    }
+
+    setFileError(null);
+
+    try {
+      const response = await fetch(
+        `${serverUrl.replace(/\/$/, "")}/sessions/${selectedSession.serverSessionId}/project`,
         {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           credentials: "include",
           body: JSON.stringify({
-            repoUrl: githubRepoUrl.trim(),
-            ...(githubProjectName.trim() ? { projectName: githubProjectName.trim() } : {})
+            projectId
           })
         }
       );
-
-      const data = (await response.json().catch(() => null)) as
-        | { repo?: WorkspaceGithubRepo; message?: string; error?: string }
-        | null;
-      if (!response.ok || !data?.repo) {
-        throw new Error(data?.message ?? data?.error ?? "Could not connect GitHub repo.");
+      if (!response.ok) {
+        throw new Error("Could not attach project to session.");
       }
 
-      const repo = data.repo;
-      setWorkspaceGithub((current) => {
-        const nextRepos = [...(current?.repos ?? [])];
-        const existingIndex = nextRepos.findIndex((currentRepo) => currentRepo.id === repo.id);
-        if (existingIndex >= 0) {
-          nextRepos[existingIndex] = repo;
-        } else {
-          nextRepos.unshift(repo);
-        }
-
-        return {
-          authConfigured: current?.authConfigured ?? false,
-          connected: current?.connected ?? true,
-          user: current?.user ?? null,
-          canManage: current?.canManage ?? true,
-          repos: nextRepos
-        };
-      });
-      setGithubRepoUrl("");
-      setGithubProjectName("");
-      await loadWorkspaceGit(selectedWorkspace.id);
+      const data = (await response.json()) as { session: SessionRecord };
+      setWorkspaceTree((current) =>
+        current.map((workspace) => ({
+          ...workspace,
+          sessions: workspace.sessions.map((session) =>
+            session.id === selectedSession.id
+              ? {
+                  ...session,
+                  ...data.session,
+                  serverSessionId: data.session.id
+                }
+              : session
+          )
+        }))
+      );
+      setSessionFiles(null);
     } catch (error) {
-      setGithubError(error instanceof Error ? error.message : "Could not connect GitHub repo.");
+      setFileError(error instanceof Error ? error.message : "Could not attach project.");
+    }
+  }
+
+  async function handleCreateSessionWorktree() {
+    if (!selectedSession?.serverSessionId || !selectedSession.projectId) {
+      return;
+    }
+
+    setIsCreatingWorktree(true);
+    setFileError(null);
+
+    try {
+      const response = await fetch(
+        `${serverUrl.replace(/\/$/, "")}/sessions/${selectedSession.serverSessionId}/worktree`,
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({
+            projectId: selectedSession.projectId
+          })
+        }
+      );
+      if (!response.ok) {
+        const errorBody = (await response.json().catch(() => null)) as
+          | { message?: string; error?: string }
+          | null;
+        throw new Error(errorBody?.message ?? errorBody?.error ?? "Could not create session worktree.");
+      }
+
+      await Promise.all([
+        selectedWorkspace?.id ? loadWorkspaceGit(selectedWorkspace.id) : Promise.resolve(),
+        fetch(`${serverUrl.replace(/\/$/, "")}/workspaces/tree`, {
+          method: "GET",
+          credentials: "include"
+        })
+          .then(async (treeResponse) => {
+            if (!treeResponse.ok) {
+              return;
+            }
+
+            const data = (await treeResponse.json()) as WorkspaceTreeResponse;
+            const nextTree =
+              data.workspaces?.map((workspace) => ({
+                ...workspace,
+                sessions: workspace.sessions.map((session) => ({
+                  ...session,
+                  serverSessionId: session.id
+                }))
+              })) ?? [];
+
+            setWorkspaceTree(nextTree);
+          })
+      ]);
+
+      await loadSessionFiles(selectedSession.serverSessionId);
+    } catch (error) {
+      setFileError(error instanceof Error ? error.message : "Could not create session worktree.");
     } finally {
-      setIsConnectingGithub(false);
+      setIsCreatingWorktree(false);
     }
   }
 
@@ -936,8 +1111,13 @@ export default function AppHome() {
               <div key={workspace.id} className="space-y-2">
                 <button
                   type="button"
-                  className="flex w-full items-center gap-2 text-left text-sm"
-                  onClick={() => toggleWorkspace(workspace.id)}
+                  className={`flex w-full items-center gap-2 rounded-lg px-2 py-1 text-left text-sm ${
+                    selectedWorkspace?.id === workspace.id ? "bg-accent" : ""
+                  }`}
+                  onClick={() => {
+                    handleSelectWorkspace(workspace.id);
+                    toggleWorkspace(workspace.id);
+                  }}
                   aria-expanded={expanded[workspace.id]}
                 >
                   <span className={`transition-transform ${expanded[workspace.id] ? "rotate-90" : ""}`}>
@@ -956,7 +1136,10 @@ export default function AppHome() {
                         <button
                           key={session.id}
                           type="button"
-                          onClick={() => setSelectedSessionId(session.id)}
+                          onClick={() => {
+                            setSelectedSessionId(session.id);
+                            setSelectedWorkspaceId(workspace.id);
+                          }}
                           className={`w-full rounded-xl border px-3 py-2 text-left transition-colors ${
                             selectedSessionId === session.id
                               ? "border-primary bg-primary/10"
@@ -979,14 +1162,20 @@ export default function AppHome() {
                       Schedules
                     </div>
                     <div className="space-y-1">
-                      {workspace.schedules.map((schedule) => (
-                        <div
-                          key={schedule.id}
-                          className="rounded-lg border border-border bg-background/30 px-3 py-2 text-xs text-muted-foreground"
-                        >
-                          {schedule.title}
+                      {workspace.schedules.length > 0 ? (
+                        workspace.schedules.map((schedule) => (
+                          <div
+                            key={schedule.id}
+                            className="rounded-lg border border-border bg-background/30 px-3 py-2 text-xs text-muted-foreground"
+                          >
+                            {schedule.title}
+                          </div>
+                        ))
+                      ) : (
+                        <div className="rounded-lg border border-dashed border-border bg-background/20 px-3 py-2 text-xs text-muted-foreground">
+                          No schedules yet.
                         </div>
-                      ))}
+                      )}
                     </div>
                   </div>
                 ) : null}
@@ -1018,8 +1207,8 @@ export default function AppHome() {
                   </h1>
                   <p className="mt-1 text-sm text-muted-foreground">
                     {selectedSession
-                      ? `Standard AI chat for ${selectedSession.model} on ${selectedSession.branch}.`
-                      : "Choose a session from the left to continue the thread."}
+                      ? `Server-backed AI chat for ${selectedSession.model} on ${selectedSession.branch}.`
+                      : "Choose a session or workspace to manage server-side automation."}
                   </p>
                 </div>
               </div>
@@ -1050,6 +1239,9 @@ export default function AppHome() {
                 </div>
                 <div className="rounded-full border border-border px-3 py-1 text-xs text-muted-foreground">
                   Updated {selectedSession.updated}
+                </div>
+                <div className="rounded-full border border-border px-3 py-1 text-xs text-muted-foreground">
+                  {syncedRepos.length} server checkouts ready
                 </div>
               </div>
             ) : null}
@@ -1090,9 +1282,11 @@ export default function AppHome() {
               <div className="mx-auto flex h-full max-w-3xl items-center justify-center">
                 <Card className="w-full border-dashed bg-card/50">
                   <CardHeader>
-                    <CardTitle>Pick a workspace session</CardTitle>
+                    <CardTitle>{selectedWorkspace ? `No session selected in ${selectedWorkspace.name}` : "Pick a workspace session"}</CardTitle>
                     <CardDescription>
-                      The main panel turns into a normal AI conversation once a session is selected.
+                      {selectedWorkspace
+                        ? "You can still connect repos and sync server files from the tools panel."
+                        : "The main panel turns into a normal AI conversation once a session is selected."}
                     </CardDescription>
                   </CardHeader>
                 </Card>
@@ -1183,23 +1377,23 @@ export default function AppHome() {
               <div className="space-y-3">
                 <Card>
                   <CardHeader>
-                    <CardTitle>Session context</CardTitle>
+                    <CardTitle>Desktop Workflow</CardTitle>
                     <CardDescription>
                       {selectedSession
-                        ? `${selectedSession.contextCount} items attached to this conversation.`
-                        : "Select a session to inspect its context bundle."}
+                        ? "Session file browsing and worktree actions now live in the desktop app."
+                        : "Select a session to view desktop workflow guidance."}
                     </CardDescription>
                   </CardHeader>
                   {selectedSession ? (
-                    <CardContent className="space-y-2 text-xs text-muted-foreground">
+                    <CardContent className="space-y-3 text-xs text-muted-foreground">
                       <div className="rounded-lg border border-border px-3 py-2">
-                        `apps/web/app/app/page.tsx`
+                        Use the desktop app for:
+                        <div className="mt-2">Attach a synced repo to the session</div>
+                        <div>Create or reset a session worktree</div>
+                        <div>Browse and preview synced files</div>
                       </div>
                       <div className="rounded-lg border border-border px-3 py-2">
-                        `apps/server/src/routes/agents.ts`
-                      </div>
-                      <div className="rounded-lg border border-border px-3 py-2">
-                        `packages/agent/src/index.ts`
+                        Use this web portal for workspace administration, GitHub repo management, and server sync status.
                       </div>
                     </CardContent>
                   ) : null}
@@ -1227,23 +1421,25 @@ export default function AppHome() {
               </div>
             </TabsContent>
             <TabsContent value="activity">
-              <Card>
-                <CardHeader>
-                  <CardTitle>Recent activity</CardTitle>
-                  <CardDescription>Latest work on the selected session.</CardDescription>
-                </CardHeader>
-                <CardContent className="space-y-3 text-xs text-muted-foreground">
-                  <div className="rounded-lg border border-border px-3 py-2">
-                    2m ago · Session state synced to workspace server
-                  </div>
-                  <div className="rounded-lg border border-border px-3 py-2">
-                    11m ago · Context bundle updated with auth routes
-                  </div>
-                  <div className="rounded-lg border border-border px-3 py-2">
-                    42m ago · Web workspace shell refreshed
-                  </div>
-                </CardContent>
-              </Card>
+                <Card>
+                  <CardHeader>
+                    <CardTitle>Recent activity</CardTitle>
+                    <CardDescription>Latest server-backed work in this workspace.</CardDescription>
+                  </CardHeader>
+                  <CardContent className="space-y-3 text-xs text-muted-foreground">
+                    {recentActivity.length > 0 ? (
+                      recentActivity.map((event) => (
+                        <div key={event.id} className="rounded-lg border border-border px-3 py-2">
+                          {event.label}
+                        </div>
+                      ))
+                    ) : (
+                      <div className="rounded-lg border border-dashed border-border px-3 py-2">
+                        No recent server activity yet.
+                      </div>
+                    )}
+                  </CardContent>
+                </Card>
             </TabsContent>
             <TabsContent value="integrations">
               <div className="space-y-3">
@@ -1375,50 +1571,32 @@ export default function AppHome() {
                       <div className="text-xs text-destructive">{githubError}</div>
                     ) : null}
                     {workspaceGithub?.canManage ? (
-                      <div className="space-y-2">
-                        <input
-                          value={githubRepoUrl}
-                          onChange={(event) => setGithubRepoUrl(event.target.value)}
-                          placeholder="https://github.com/owner/repo"
-                          className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none transition focus:border-foreground/30"
-                        />
-                        <input
-                          value={githubProjectName}
-                          onChange={(event) => setGithubProjectName(event.target.value)}
-                          placeholder="Project name (optional)"
-                          className="w-full rounded-lg border border-border bg-background px-3 py-2 text-sm outline-none transition focus:border-foreground/30"
-                        />
-                        <Button
-                          size="sm"
-                          variant="outline"
-                          className="w-full justify-center"
-                          onClick={handleConnectGithub}
-                          disabled={
-                            isConnectingGithub ||
-                            !githubRepoUrl.trim() ||
-                            !workspaceGithub.connected ||
-                            githubAuth.inProgress
-                          }
-                        >
-                          {isConnectingGithub ? "Connecting..." : "Connect repo"}
-                        </Button>
+                      <div className="rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground">
+                        Manage workspace repos from the Admin page. Repo selection is restricted to workspace owners.
                       </div>
                     ) : workspaceGithub && !isLoadingGithub ? (
                       <div className="rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground">
-                        Viewer access only. Ask an owner or maintainer to connect a repo.
+                        Repo selection is admin-only. Ask the workspace owner to manage connected repos.
                       </div>
                     ) : null}
                   </CardContent>
                 </Card>
                 <Card>
                   <CardHeader>
-                    <CardTitle>Git</CardTitle>
-                    <CardDescription>Local repo state for the workspace checkout on this machine.</CardDescription>
+                    <CardTitle>Server checkouts</CardTitle>
+                    <CardDescription>
+                      Repositories synced onto the HawkCode server so schedules can run without the desktop app.
+                    </CardDescription>
                   </CardHeader>
                   <CardContent className="space-y-3">
+                    {workspaceGit?.checkoutRoot ? (
+                      <div className="rounded-lg border border-border px-3 py-2 text-xs text-muted-foreground">
+                        Checkout root: {workspaceGit.checkoutRoot}
+                      </div>
+                    ) : null}
                     {isLoadingGit ? (
                       <div className="rounded-lg border border-dashed border-border px-3 py-2 text-xs text-muted-foreground">
-                        Loading Git status...
+                        Loading server checkout status...
                       </div>
                     ) : workspaceGit?.repos.length ? (
                       <div className="space-y-2">
@@ -1429,7 +1607,13 @@ export default function AppHome() {
                           >
                             <div className="flex items-center justify-between gap-3">
                               <span className="font-medium text-foreground">{repo.repoName}</span>
-                              <span>{repo.local ? "Local checkout matched" : "Remote only"}</span>
+                              <span>
+                                {repo.serverSync.status === "ready"
+                                  ? "Synced"
+                                  : repo.serverSync.status === "error"
+                                    ? "Needs attention"
+                                    : "Not synced"}
+                              </span>
                             </div>
                             <a
                               href={repo.repoUrl}
@@ -1439,37 +1623,67 @@ export default function AppHome() {
                             >
                               {repo.repoUrl}
                             </a>
-                            {repo.local ? (
+                            {repo.serverSync.status === "ready" ? (
                               <div className="mt-2 space-y-1">
                                 <div>
-                                  Branch `{repo.local.branch}` · {repo.local.clean ? "Clean" : "Dirty"}
-                                  {repo.local.ahead || repo.local.behind
-                                    ? ` · ahead ${repo.local.ahead} / behind ${repo.local.behind}`
+                                  Branch `{repo.serverSync.branch}` ·{" "}
+                                  {repo.serverSync.clean ? "Clean" : "Dirty"}
+                                  {repo.serverSync.ahead || repo.serverSync.behind
+                                    ? ` · ahead ${repo.serverSync.ahead} / behind ${repo.serverSync.behind}`
                                     : ""}
                                 </div>
                                 <div>
-                                  {repo.local.changedFiles} changed · {repo.local.stagedFiles} staged ·{" "}
-                                  {repo.local.modifiedFiles} modified · {repo.local.untrackedFiles} untracked
+                                  {repo.serverSync.changedFiles} changed · {repo.serverSync.stagedFiles} staged ·{" "}
+                                  {repo.serverSync.modifiedFiles} modified ·{" "}
+                                  {repo.serverSync.untrackedFiles} untracked
                                 </div>
-                                <div className="truncate">Path: {repo.local.path}</div>
-                                <div>
-                                  Last commit {repo.local.lastCommit.shortSha} · {repo.local.lastCommit.subject}
-                                </div>
+                                <div className="truncate">Path: {repo.serverSync.path}</div>
+                                {repo.serverSync.lastSyncedAt ? (
+                                  <div>Last synced {formatTimestamp(repo.serverSync.lastSyncedAt)}</div>
+                                ) : null}
+                                {repo.serverSync.lastCommit ? (
+                                  <div>
+                                    Last commit {repo.serverSync.lastCommit.shortSha} ·{" "}
+                                    {repo.serverSync.lastCommit.subject}
+                                  </div>
+                                ) : null}
                               </div>
+                            ) : repo.serverSync.status === "error" ? (
+                              <div className="mt-2 space-y-1 text-destructive">
+                                <div>Server checkout is unavailable.</div>
+                                {repo.serverSync.path ? (
+                                  <div className="truncate text-xs text-muted-foreground">
+                                    Expected path: {repo.serverSync.path}
+                                  </div>
+                                ) : null}
+                                {repo.serverSync.error ? (
+                                  <div className="text-xs">{repo.serverSync.error}</div>
+                                ) : null}
+                              </div>
+                            ) : (
+                              <div className="mt-2 text-xs text-muted-foreground">
+                                This repo is connected, but the server has not pulled files yet.
+                              </div>
+                            )}
+                            {workspaceGit?.canManage ? (
+                              <Button
+                                size="sm"
+                                variant="outline"
+                                className="mt-3 w-full justify-center"
+                                onClick={() => handleSyncProject(repo.projectId)}
+                                disabled={isLoadingGit}
+                              >
+                                {repo.serverSync.status === "ready" ? "Sync latest to server" : "Sync repo to server"}
+                              </Button>
                             ) : null}
                           </div>
                         ))}
                       </div>
                     ) : (
                       <div className="rounded-lg border border-dashed border-border px-3 py-2 text-xs text-muted-foreground">
-                        No Git repos connected for this workspace yet.
+                        No repos connected for this workspace yet.
                       </div>
                     )}
-                    {workspaceGit && !workspaceGit.detected ? (
-                      <div className="rounded-lg border border-dashed border-border px-3 py-2 text-xs text-muted-foreground">
-                        No local Git checkout detected from the running server workspace.
-                      </div>
-                    ) : null}
                     {gitError ? <div className="text-xs text-destructive">{gitError}</div> : null}
                     <Button
                       size="sm"
@@ -1478,14 +1692,14 @@ export default function AppHome() {
                       onClick={() => selectedWorkspace?.id && void loadWorkspaceGit(selectedWorkspace.id)}
                       disabled={isLoadingGit || !selectedWorkspace?.id}
                     >
-                      {isLoadingGit ? "Refreshing..." : "Refresh Git status"}
+                      {isLoadingGit ? "Refreshing..." : "Refresh server status"}
                     </Button>
                   </CardContent>
                 </Card>
                 <Card>
                   <CardHeader>
-                    <CardTitle>Local tools</CardTitle>
-                    <CardDescription>Shell, tests, and file context.</CardDescription>
+                    <CardTitle>Server tools</CardTitle>
+                    <CardDescription>Workspace automation lives on the server now.</CardDescription>
                   </CardHeader>
                   <CardContent className="space-y-2">
                     <Button size="sm" variant="outline" className="w-full justify-start">
