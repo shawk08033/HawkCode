@@ -22,7 +22,7 @@ export const setupConfigSchema = z.object({
 
 export type SetupConfig = z.infer<typeof setupConfigSchema>;
 
-export const agentProviderSchema = z.enum(["codex", "cursor", "openrouter"]);
+export const agentProviderSchema = z.enum(["codex", "cursor", "gemini", "openrouter"]);
 
 export const agentChatRoleSchema = z.enum(["system", "user", "assistant"]);
 

@@ -12,7 +12,7 @@ type Status = {
 };
 
 type ProviderInfo = {
-  name: "codex" | "cursor" | "openrouter";
+  name: "codex" | "cursor" | "gemini" | "openrouter";
   label: string;
   defaultModel: string;
 };
@@ -90,7 +90,7 @@ type WorkspaceGithubState = {
 type AgentReplyResponse = {
   sessionId: string;
   agentRunId: string;
-  provider: "codex" | "cursor" | "openrouter";
+  provider: "codex" | "cursor" | "gemini" | "openrouter";
   model: string;
   message: {
     id: string;
@@ -115,6 +115,15 @@ type CursorCliStatus = {
   inProgress: boolean;
   command: string | null;
   authUrl?: string;
+  statusText: string;
+  error?: string;
+};
+
+type GeminiCliStatus = {
+  found: boolean;
+  loggedIn: boolean;
+  command: string | null;
+  email?: string;
   statusText: string;
   error?: string;
 };
@@ -455,6 +464,12 @@ const CURSOR_SETUP_PROVIDER: ProviderInfo = {
   defaultModel: "auto"
 };
 
+const GEMINI_SETUP_PROVIDER: ProviderInfo = {
+  name: "gemini",
+  label: "Gemini CLI (setup required)",
+  defaultModel: "auto"
+};
+
 function getModelOptions(provider?: ProviderInfo | null) {
   if (!provider) {
     return [];
@@ -466,6 +481,12 @@ function getModelOptions(provider?: ProviderInfo | null) {
 
   if (provider.name === "cursor") {
     return [provider.defaultModel, "auto", "claude-4.6-opus-high-thinking", "gpt-5.4-medium", "gpt-5-mini"].filter(
+      (value, index, all) => all.indexOf(value) === index
+    );
+  }
+
+  if (provider.name === "gemini") {
+    return [provider.defaultModel, "auto", "gemini-2.5-flash", "gemini-2.5-pro", "gemini-3-flash-preview"].filter(
       (value, index, all) => all.indexOf(value) === index
     );
   }
@@ -738,7 +759,7 @@ export default function App() {
     "ws-2": false
   });
   const [selectedSessionId, setSelectedSessionId] = useState<string | null>(null);
-  const [selectedProvider, setSelectedProvider] = useState<"codex" | "cursor" | "openrouter" | null>(null);
+  const [selectedProvider, setSelectedProvider] = useState<"codex" | "cursor" | "gemini" | "openrouter" | null>(null);
   const [selectedModel, setSelectedModel] = useState("");
   const [isSending, setIsSending] = useState(false);
   const [sendError, setSendError] = useState<string | null>(null);
@@ -748,6 +769,12 @@ export default function App() {
   const [codexAuth, setCodexAuth] = useState<CodexAuthStatus>({
     loggedIn: false,
     inProgress: false
+  });
+  const [geminiCli, setGeminiCli] = useState<GeminiCliStatus>({
+    found: false,
+    loggedIn: false,
+    command: null,
+    statusText: "Gemini CLI not found"
   });
   const [cursorCli, setCursorCli] = useState<CursorCliStatus>({
     found: false,
@@ -875,12 +902,17 @@ export default function App() {
     availableProviders.find((provider) => provider.name === selectedProvider) ??
     preferProvider(availableProviders);
   const providerOptions = useMemo(() => {
-    if (cursorCli.found) {
-      return availableProviders;
+    const options = [...availableProviders];
+    if (!geminiCli.found && !options.some((provider) => provider.name === "gemini")) {
+      options.push(GEMINI_SETUP_PROVIDER);
     }
-    return [...availableProviders, CURSOR_SETUP_PROVIDER];
-  }, [availableProviders, cursorCli.found]);
-  const cursorAvailable = availableProviders.some((provider) => provider.name === "cursor");
+    if (!cursorCli.found && !options.some((provider) => provider.name === "cursor")) {
+      options.push(CURSOR_SETUP_PROVIDER);
+    }
+    return options;
+  }, [availableProviders, cursorCli.found, geminiCli.found]);
+  const geminiSetupSelected = selectedProvider === "gemini" && !geminiCli.found;
+  const geminiLoginRequired = selectedProvider === "gemini" && geminiCli.found && !geminiCli.loggedIn;
   const cursorSetupSelected = selectedProvider === "cursor" && !cursorCli.found;
   const cursorLoginRequired = selectedProvider === "cursor" && cursorCli.found && !cursorCli.loggedIn;
   const availableModels = useMemo(() => getModelOptions(activeProvider), [activeProvider]);
@@ -899,8 +931,9 @@ export default function App() {
   }, [activeEditorTab]);
 
   async function refreshAvailableProviders() {
-    const [codexResult, cursorResult] = await Promise.allSettled([
+    const [codexResult, geminiResult, cursorResult] = await Promise.allSettled([
       window.hawkcode.getCodexAuthStatus(),
+      window.hawkcode.getGeminiCliStatus(),
       window.hawkcode.getCursorCliStatus()
     ]);
 
@@ -924,8 +957,19 @@ export default function App() {
             statusText: "Could not check Cursor CLI state.",
             error: "Could not check Cursor CLI state."
           } satisfies CursorCliStatus;
+    const nextGeminiCli =
+      geminiResult.status === "fulfilled"
+        ? geminiResult.value
+        : {
+            found: false,
+            loggedIn: false,
+            command: null,
+            statusText: "Could not check Gemini CLI state.",
+            error: "Could not check Gemini CLI state."
+          } satisfies GeminiCliStatus;
 
     setCodexAuth(nextCodexAuth);
+    setGeminiCli(nextGeminiCli);
     setCursorCli(nextCursorCli);
 
     const nextLocalProviders: ProviderInfo[] = [
@@ -934,6 +978,13 @@ export default function App() {
             name: "codex",
             label: "Codex",
             defaultModel: "gpt-5"
+          } satisfies ProviderInfo]
+        : []),
+      ...(nextGeminiCli.found
+        ? [{
+            name: "gemini",
+            label: nextGeminiCli.loggedIn ? "Gemini CLI" : "Gemini CLI (login required)",
+            defaultModel: "auto"
           } satisfies ProviderInfo]
         : []),
       ...(nextCursorCli.found
@@ -963,7 +1014,10 @@ export default function App() {
     setServerProviders(nextProviders);
     setSelectedProvider((current) => {
       const merged = mergeProviders(nextProviders, nextLocalProviders);
-      if (current && (current === "cursor" || merged.some((provider) => provider.name === current))) {
+      if (
+        current &&
+        (current === "cursor" || current === "gemini" || merged.some((provider) => provider.name === current))
+      ) {
         return current;
       }
       return preferProvider(merged)?.name ?? null;
@@ -2083,7 +2137,11 @@ export default function App() {
     setDraft("");
 
     try {
-      if (activeProvider.name === "codex" || activeProvider.name === "cursor") {
+      if (
+        activeProvider.name === "codex" ||
+        activeProvider.name === "cursor" ||
+        activeProvider.name === "gemini"
+      ) {
         const localResult = await window.hawkcode.generateLocalAgentReply({
           provider: activeProvider.name,
           model: nextModel,
@@ -3132,6 +3190,10 @@ export default function App() {
                       <div>
                         {activeProvider
                           ? `Using ${activeProvider?.label ?? "agent"}${selectedModel ? ` · ${selectedModel}` : ""} for this reply.`
+                          : geminiSetupSelected
+                            ? "Gemini CLI is selected but not installed yet."
+                          : geminiLoginRequired
+                            ? "Gemini CLI is installed, but Google sign-in is required."
                           : cursorSetupSelected
                             ? "Cursor CLI is selected but not installed yet."
                           : cursorLoginRequired
@@ -3144,7 +3206,7 @@ export default function App() {
                       <select
                         value={selectedProvider ?? ""}
                         onChange={(event) =>
-                          setSelectedProvider(event.target.value as "codex" | "cursor" | "openrouter")
+                          setSelectedProvider(event.target.value as "codex" | "cursor" | "gemini" | "openrouter")
                         }
                         className="h-9 rounded-md border border-border bg-background px-3 text-sm"
                         disabled={providerOptions.length === 0 || isSending}
@@ -3160,7 +3222,14 @@ export default function App() {
                         value={selectedModel}
                         onChange={(event) => setSelectedModel(event.target.value)}
                         className="h-9 w-44 rounded-md border border-border bg-background px-3 text-sm"
-                        disabled={!activeProvider || isSending || cursorSetupSelected || cursorLoginRequired}
+                        disabled={
+                          !activeProvider ||
+                          isSending ||
+                          geminiSetupSelected ||
+                          geminiLoginRequired ||
+                          cursorSetupSelected ||
+                          cursorLoginRequired
+                        }
                       >
                         {availableModels.map((model) => (
                           <option key={model} value={model}>
@@ -3186,6 +3255,8 @@ export default function App() {
                           !draft.trim() ||
                           !activeProvider ||
                           isSending ||
+                          geminiSetupSelected ||
+                          geminiLoginRequired ||
                           cursorSetupSelected ||
                           cursorLoginRequired
                         }
@@ -3195,6 +3266,65 @@ export default function App() {
                       </Button>
                     </div>
                   </div>
+                  {geminiSetupSelected ? (
+                    <div className="mt-3 rounded-2xl border border-dashed border-border bg-background/80 px-4 py-3 text-xs text-muted-foreground">
+                      <div className="font-medium text-foreground">Gemini CLI setup required</div>
+                      <div className="mt-1">
+                        Install the CLI, then restart HawkCode or reselect the provider.
+                      </div>
+                      <div className="mt-2 font-mono text-[11px] text-foreground">
+                        npm install -g @google/gemini-cli
+                      </div>
+                      <div className="mt-2">
+                        HawkCode uses Gemini CLI with Google sign-in, not API keys.
+                      </div>
+                      <div className="mt-3 flex gap-2">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => void refreshAvailableProviders()}
+                        >
+                          Recheck Gemini CLI
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => void window.hawkcode.openExternalUrl("https://geminicli.com/docs/get-started/authentication")}
+                        >
+                          Open Gemini auth docs
+                        </Button>
+                      </div>
+                    </div>
+                  ) : null}
+                  {geminiLoginRequired ? (
+                    <div className="mt-3 rounded-2xl border border-dashed border-border bg-background/80 px-4 py-3 text-xs text-muted-foreground">
+                      <div className="font-medium text-foreground">Gemini CLI login required</div>
+                      <div className="mt-1">
+                        Start `gemini`, choose `Sign in with Google`, and use the Google account tied to your Google AI plan.
+                      </div>
+                      <div className="mt-2 font-mono text-[11px] text-foreground">gemini</div>
+                      <div className="mt-2">{geminiCli.statusText}</div>
+                      {geminiCli.command ? (
+                        <div className="mt-1">Detected command: `{geminiCli.command}`</div>
+                      ) : null}
+                      <div className="mt-3 flex gap-2">
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => void refreshAvailableProviders()}
+                        >
+                          Recheck Gemini CLI
+                        </Button>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => void window.hawkcode.openExternalUrl("https://geminicli.com/docs/get-started/authentication")}
+                        >
+                          Open Gemini auth docs
+                        </Button>
+                      </div>
+                    </div>
+                  ) : null}
                   {cursorSetupSelected ? (
                     <div className="mt-3 rounded-2xl border border-dashed border-border bg-background/80 px-4 py-3 text-xs text-muted-foreground">
                       <div className="font-medium text-foreground">Cursor CLI setup required</div>
