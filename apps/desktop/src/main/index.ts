@@ -22,6 +22,8 @@ if (allowSelfSigned) {
 type StoreShape = {
   serverUrl?: string;
   trustedCerts?: Record<string, string>;
+  cursorChats?: Record<string, string>;
+  geminiSessions?: Record<string, string>;
 };
 
 type PendingCert = {
@@ -33,7 +35,9 @@ type PendingCert = {
 
 const store = new Store<StoreShape>({
   defaults: {
-    trustedCerts: {}
+    trustedCerts: {},
+    cursorChats: {},
+    geminiSessions: {}
   }
 });
 
@@ -195,6 +199,68 @@ function getCursorEnv(command: string) {
     ...process.env,
     PATH: nextPath
   };
+}
+
+function getStoredCursorChats() {
+  return store.get("cursorChats") ?? {};
+}
+
+function getStoredGeminiSessions() {
+  return store.get("geminiSessions") ?? {};
+}
+
+function getCursorChatId(sessionId?: string) {
+  if (!sessionId) {
+    return null;
+  }
+
+  const chats = getStoredCursorChats();
+  return chats[sessionId] ?? null;
+}
+
+function setCursorChatId(sessionId: string, chatId: string) {
+  const chats = getStoredCursorChats();
+  store.set("cursorChats", {
+    ...chats,
+    [sessionId]: chatId
+  });
+}
+
+function clearCursorChatId(sessionId?: string) {
+  if (!sessionId) {
+    return;
+  }
+
+  const chats = { ...getStoredCursorChats() };
+  delete chats[sessionId];
+  store.set("cursorChats", chats);
+}
+
+function getGeminiResumeSessionId(sessionId?: string) {
+  if (!sessionId) {
+    return null;
+  }
+
+  const sessions = getStoredGeminiSessions();
+  return sessions[sessionId] ?? null;
+}
+
+function setGeminiResumeSessionId(sessionId: string, resumeSessionId: string) {
+  const sessions = getStoredGeminiSessions();
+  store.set("geminiSessions", {
+    ...sessions,
+    [sessionId]: resumeSessionId
+  });
+}
+
+function clearGeminiResumeSessionId(sessionId?: string) {
+  if (!sessionId) {
+    return;
+  }
+
+  const sessions = { ...getStoredGeminiSessions() };
+  delete sessions[sessionId];
+  store.set("geminiSessions", sessions);
 }
 
 function getGeminiEnv() {
@@ -471,7 +537,11 @@ async function generateCodexReply(messages: Array<{ role: string; content: strin
   };
 }
 
-async function generateGeminiReply(messages: Array<{ role: string; content: string }>, model = defaultGeminiModel) {
+async function generateGeminiReply(
+  sessionId: string | undefined,
+  messages: Array<{ role: string; content: string }>,
+  model = defaultGeminiModel
+) {
   const resolvedCommand = getResolvedGeminiCommand();
   if (!resolvedCommand) {
     throw new Error(
@@ -481,13 +551,16 @@ async function generateGeminiReply(messages: Array<{ role: string; content: stri
 
   const prompt = buildGeminiPrompt(messages);
   const args = [
-    "-p",
-    prompt,
     "--output-format",
     "json",
     "--approval-mode",
     "plan"
   ];
+  const resumeSessionId = getGeminiResumeSessionId(sessionId);
+  if (resumeSessionId) {
+    args.push("--resume", resumeSessionId);
+  }
+  args.push("-p", prompt);
   if (model && model.trim().length > 0 && model !== "auto") {
     args.push("-m", model);
   }
@@ -502,20 +575,48 @@ async function generateGeminiReply(messages: Array<{ role: string; content: stri
     stdout = result.stdout;
     stderr = result.stderr;
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Gemini CLI request failed.";
-    throw new Error(`Gemini CLI request failed: ${message}`);
+    if (resumeSessionId && sessionId) {
+      clearGeminiResumeSessionId(sessionId);
+      const retryArgs = [
+        "--output-format",
+        "json",
+        "--approval-mode",
+        "plan",
+        "-p",
+        prompt,
+        ...(model && model.trim().length > 0 && model !== "auto" ? ["-m", model] : [])
+      ];
+      try {
+        const retryResult = await execFileAsync(resolvedCommand, retryArgs, {
+          cwd: process.cwd(),
+          env: getGeminiEnv()
+        });
+        stdout = retryResult.stdout;
+        stderr = retryResult.stderr;
+      } catch (retryError) {
+        const retryMessage = retryError instanceof Error ? retryError.message : "Gemini CLI request failed.";
+        throw new Error(`Gemini CLI request failed: ${retryMessage}`);
+      }
+    } else {
+      const message = error instanceof Error ? error.message : "Gemini CLI request failed.";
+      throw new Error(`Gemini CLI request failed: ${message}`);
+    }
   }
 
-  let payload: { response?: string };
+  let payload: { response?: string; session_id?: string };
   const parsed = extractJsonObject(stdout) ?? extractJsonObject(stderr) ?? extractJsonObject(`${stdout}\n${stderr}`);
   if (!parsed || typeof parsed !== "object") {
     throw new Error("Gemini CLI returned invalid JSON.");
   }
-  payload = parsed as { response?: string };
+  payload = parsed as { response?: string; session_id?: string };
 
   const content = payload.response?.trim() ?? "";
   if (!content) {
     throw new Error("Gemini CLI returned an empty response.");
+  }
+
+  if (sessionId && !resumeSessionId && payload.session_id?.trim()) {
+    setGeminiResumeSessionId(sessionId, payload.session_id.trim());
   }
 
   return {
@@ -540,6 +641,34 @@ async function canUseCursor() {
   } catch {
     return false;
   }
+}
+
+async function ensureCursorChatId(sessionId?: string) {
+  if (!sessionId) {
+    return null;
+  }
+
+  const existing = getCursorChatId(sessionId);
+  if (existing) {
+    return existing;
+  }
+
+  const cursorCommand = getResolvedCursorCommand();
+  if (!cursorCommand) {
+    return null;
+  }
+
+  const result = await execFileAsync(cursorCommand, ["create-chat"], {
+    cwd: process.cwd(),
+    env: getCursorEnv(cursorCommand)
+  });
+  const chatId = stripAnsi(`${result.stdout}\n${result.stderr}`).trim();
+  if (!chatId) {
+    throw new Error("Cursor CLI did not return a resumable chat id.");
+  }
+
+  setCursorChatId(sessionId, chatId);
+  return chatId;
 }
 
 async function getCursorCliStatus() {
@@ -660,7 +789,11 @@ function startCursorCliAuth() {
   return cursorCliState;
 }
 
-async function generateCursorReply(messages: Array<{ role: string; content: string }>, model = defaultCursorModel) {
+async function generateCursorReply(
+  sessionId: string | undefined,
+  messages: Array<{ role: string; content: string }>,
+  model = defaultCursorModel
+) {
   const cursorCommand = getResolvedCursorCommand();
   if (!cursorCommand) {
     throw new Error(
@@ -669,12 +802,18 @@ async function generateCursorReply(messages: Array<{ role: string; content: stri
   }
 
   const prompt = buildCursorPrompt(messages);
+  const chatId = await ensureCursorChatId(sessionId);
   const args = [
     "-p",
     "--output-format",
     "json",
-    "--trust"
+    "--trust",
+    "--mode",
+    "ask"
   ];
+  if (chatId) {
+    args.push("--resume", chatId);
+  }
   if (model && model.trim().length > 0 && model !== "auto") {
     args.push("-m", model);
   }
@@ -688,8 +827,34 @@ async function generateCursorReply(messages: Array<{ role: string; content: stri
     });
     stdout = result.stdout;
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Cursor CLI request failed.";
-    throw new Error(`Cursor CLI request failed: ${message}`);
+    if (chatId && sessionId) {
+      clearCursorChatId(sessionId);
+      const retryChatId = await ensureCursorChatId(sessionId);
+      const retryArgs = [
+        "-p",
+        "--output-format",
+        "json",
+        "--trust",
+        "--mode",
+        "ask",
+        ...(retryChatId ? ["--resume", retryChatId] : []),
+        ...(model && model.trim().length > 0 && model !== "auto" ? ["-m", model] : []),
+        prompt
+      ];
+      try {
+        const retryResult = await execFileAsync(cursorCommand, retryArgs, {
+          cwd: process.cwd(),
+          env: getCursorEnv(cursorCommand)
+        });
+        stdout = retryResult.stdout;
+      } catch (retryError) {
+        const retryMessage = retryError instanceof Error ? retryError.message : "Cursor CLI request failed.";
+        throw new Error(`Cursor CLI request failed: ${retryMessage}`);
+      }
+    } else {
+      const message = error instanceof Error ? error.message : "Cursor CLI request failed.";
+      throw new Error(`Cursor CLI request failed: ${message}`);
+    }
   }
 
   let payload: { type?: string; subtype?: string; is_error?: boolean; result?: string };
@@ -918,10 +1083,10 @@ app.whenReady().then(() => {
       return generateCodexReply(payload.messages, payload.model);
     }
     if (payload.provider === "gemini") {
-      return generateGeminiReply(payload.messages, payload.model);
+      return generateGeminiReply(payload.sessionId, payload.messages, payload.model);
     }
     if (payload.provider === "cursor") {
-      return generateCursorReply(payload.messages, payload.model);
+      return generateCursorReply(payload.sessionId, payload.messages, payload.model);
     }
     throw new Error(`Unsupported local provider: ${payload.provider as string}`);
   });

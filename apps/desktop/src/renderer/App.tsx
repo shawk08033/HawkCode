@@ -2117,6 +2117,56 @@ export default function App() {
     });
   }
 
+  function buildLocalSelectionContextMessage() {
+    if (!activeEditorTab || !selectedFileLineRange || activeEditorView === "diff") {
+      return null;
+    }
+
+    const startIndex = Math.max(0, selectedFileLineRange.start - 1);
+    const endIndex = Math.min(selectedFileLines.length, selectedFileLineRange.end);
+    const snippet = selectedFileLines.slice(startIndex, endIndex).join("\n").trim();
+    if (!snippet) {
+      return null;
+    }
+
+    const label =
+      selectedFileLineRange.start === selectedFileLineRange.end
+        ? `line ${selectedFileLineRange.start}`
+        : `lines ${selectedFileLineRange.start}-${selectedFileLineRange.end}`;
+
+    return {
+      role: "system" as const,
+      content: [
+        `Selected code context from ${activeEditorTab.path} ${label}:`,
+        "```",
+        snippet,
+        "```"
+      ].join("\n")
+    };
+  }
+
+  function buildLocalProviderMessages(prompt: string) {
+    const recentConversation = selectedSession
+      ? selectedSession.messages
+          .filter((message) => message.role !== "system")
+          .slice(-8)
+          .map((message) => ({
+            role: message.role,
+            content: message.content
+          }))
+      : [];
+    const selectedContext = buildLocalSelectionContextMessage();
+
+    return [
+      ...recentConversation,
+      ...(selectedContext ? [selectedContext] : []),
+      {
+        role: "user" as const,
+        content: prompt
+      }
+    ];
+  }
+
   async function handleSend() {
     if (!selectedSession || !draft.trim() || !activeProvider) {
       return;
@@ -2144,19 +2194,9 @@ export default function App() {
       ) {
         const localResult = await window.hawkcode.generateLocalAgentReply({
           provider: activeProvider.name,
+          sessionId: selectedSession.id,
           model: nextModel,
-          messages: [
-            ...selectedSession.messages
-              .filter((message) => message.role !== "system")
-              .map((message) => ({
-              role: message.role,
-              content: message.content
-            })),
-            {
-              role: "user",
-              content: prompt
-            }
-          ]
+          messages: buildLocalProviderMessages(prompt)
         });
 
         const commitResponse = await fetch(`${serverUrl.replace(/\/$/, "")}/agent/reply/commit`, {
