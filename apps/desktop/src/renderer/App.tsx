@@ -107,6 +107,56 @@ type AgentToolCall = {
   durationMs?: number;
 };
 
+type LocalAgentRun = {
+  id: string;
+  provider: "codex" | "cursor" | "gemini";
+  sessionId?: string;
+  model: string;
+  status: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+  startedAt: string;
+  finishedAt?: string;
+  prompt: string;
+  content?: string;
+  error?: string;
+  stdout: string;
+  stderr: string;
+  commandEvents?: Array<{
+    id: string;
+    command: string;
+    status: "running" | "completed" | "failed";
+    output: string;
+    exitCode?: number | null;
+  }>;
+  toolCalls?: AgentToolCall[];
+};
+
+type PendingLocalAgentRun = {
+  runId: string;
+  localSessionId: string;
+  serverSessionId?: string;
+  optimisticId: string;
+  prompt: string;
+  worktreeRoot?: string | null;
+};
+
+type ConversationFeedItem =
+  | {
+      id: string;
+      kind: "message";
+      role: ChatMessage["role"];
+      content: string;
+      timestamp: string;
+    }
+  | {
+      id: string;
+      kind: "command";
+      command: string;
+      status: "running" | "completed" | "failed";
+      output: string;
+      exitCode?: number | null;
+      timestamp: string;
+    };
+
 type CodexAuthStatus = {
   loggedIn: boolean;
   inProgress: boolean;
@@ -311,6 +361,36 @@ function formatTimestamp(value?: string) {
   });
 }
 
+function formatRunStatus(status: LocalAgentRun["status"]) {
+  return status === "queued"
+    ? "Queued"
+    : status === "running"
+      ? "Running"
+      : status === "succeeded"
+        ? "Completed"
+        : status === "cancelled"
+          ? "Stopped"
+          : "Failed";
+}
+
+function summarizeRunLog(stdout: string, stderr: string) {
+  const combined = `${stderr ? `${stderr}\n` : ""}${stdout}`.trim();
+  if (!combined) {
+    return "";
+  }
+
+  return combined.length > 500 ? `${combined.slice(combined.length - 500)}` : combined;
+}
+
+function summarizeCommandOutput(output: string) {
+  const trimmed = output.trim();
+  if (!trimmed) {
+    return "";
+  }
+
+  return trimmed.length > 400 ? trimmed.slice(trimmed.length - 400) : trimmed;
+}
+
 function createInitialWorkspaces(): WorkspaceRecord[] {
   return [
     {
@@ -472,6 +552,7 @@ const CURSOR_SETUP_PROVIDER: ProviderInfo = {
 };
 
 const OPEN_FILE_MARKER_PATTERN = /\[\[open_file:([^\]\n]+)\]\]/i;
+const COMMAND_EVENT_MESSAGE_PREFIX = "[[hawkcode_command_event]]";
 const EDITOR_ASSISTANT_SYSTEM_PROMPT = [
   "You are inside HawkCode.",
   "If the user asks you to open, inspect, or focus a specific file in the HawkCode editor, append exactly one line in this format at the end of your reply: [[open_file:relative/path/to/file]]",
@@ -522,6 +603,32 @@ function parseJsonRecord(value?: string) {
 
   try {
     return JSON.parse(value) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function serializeCommandEventMessage(commandEvent: {
+  command: string;
+  status: "running" | "completed" | "failed";
+  output: string;
+  exitCode?: number | null;
+}) {
+  return `${COMMAND_EVENT_MESSAGE_PREFIX}${JSON.stringify(commandEvent)}`;
+}
+
+function parseCommandEventMessage(content: string) {
+  if (!content.startsWith(COMMAND_EVENT_MESSAGE_PREFIX)) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(content.slice(COMMAND_EVENT_MESSAGE_PREFIX.length)) as {
+      command: string;
+      status: "running" | "completed" | "failed";
+      output: string;
+      exitCode?: number | null;
+    };
   } catch {
     return null;
   }
@@ -945,6 +1052,9 @@ export default function App() {
   const [openEditorTabs, setOpenEditorTabs] = useState<EditorTab[]>([]);
   const [activeCenterTab, setActiveCenterTab] = useState<string>("chat");
   const [activeEditorView, setActiveEditorView] = useState<"source" | "diff">("source");
+  const [localAgentRuns, setLocalAgentRuns] = useState<LocalAgentRun[]>([]);
+  const [pendingLocalAgentRuns, setPendingLocalAgentRuns] = useState<PendingLocalAgentRun[]>([]);
+  const [foregroundLocalRunId, setForegroundLocalRunId] = useState<string | null>(null);
   const [selectedFileLineRange, setSelectedFileLineRange] = useState<{ start: number; end: number } | null>(
     null
   );
@@ -1054,6 +1164,67 @@ export default function App() {
     () => openEditorTabs.find((tab) => tab.path === activeCenterTab) ?? null,
     [activeCenterTab, openEditorTabs]
   );
+  const foregroundLocalRun = useMemo(
+    () => localAgentRuns.find((run) => run.id === foregroundLocalRunId) ?? null,
+    [foregroundLocalRunId, localAgentRuns]
+  );
+  const sessionLocalRuns = useMemo(
+    () =>
+      selectedSession
+        ? localAgentRuns.filter((run) => !run.sessionId || run.sessionId === selectedSession.id)
+        : localAgentRuns,
+    [localAgentRuns, selectedSession]
+  );
+  const conversationFeed = useMemo(() => {
+    if (!selectedSession) {
+      return [] as ConversationFeedItem[];
+    }
+
+    const baseMessages: ConversationFeedItem[] = selectedSession.messages.map((message) => {
+      const commandEvent = parseCommandEventMessage(message.content);
+      if (commandEvent) {
+        return {
+          id: message.id,
+          kind: "command" as const,
+          command: commandEvent.command,
+          status: commandEvent.status,
+          output: commandEvent.output,
+          exitCode: commandEvent.exitCode,
+          timestamp: message.timestamp
+        };
+      }
+
+      return {
+        id: message.id,
+        kind: "message" as const,
+        role: message.role,
+        content: message.content,
+        timestamp: message.timestamp
+      };
+    });
+
+    const pendingRunIds = new Set(
+      pendingLocalAgentRuns
+        .filter((run) => run.localSessionId === selectedSession.id)
+        .map((run) => run.runId)
+    );
+
+    const commandItems: ConversationFeedItem[] = sessionLocalRuns
+      .filter((run) => pendingRunIds.has(run.id))
+      .flatMap((run) =>
+        (run.commandEvents ?? []).map((commandEvent) => ({
+          id: `${run.id}:${commandEvent.id}`,
+          kind: "command" as const,
+          command: commandEvent.command,
+          status: commandEvent.status,
+          output: commandEvent.output,
+          exitCode: commandEvent.exitCode,
+          timestamp: formatTimestamp(run.startedAt)
+        }))
+      );
+
+    return [...baseMessages, ...commandItems];
+  }, [pendingLocalAgentRuns, selectedSession, sessionLocalRuns]);
   const selectedFileLines = useMemo(() => {
     if (!activeEditorTab) {
       return [];
@@ -2222,6 +2393,46 @@ export default function App() {
     );
   }
 
+  function appendLocalRunCommandMessages(localSessionId: string, run: LocalAgentRun) {
+    const commandEvents = run.commandEvents ?? [];
+    if (commandEvents.length === 0) {
+      return;
+    }
+
+    setWorkspaceTree((current) =>
+      current.map((workspace) => ({
+        ...workspace,
+        sessions: workspace.sessions.map((session) => {
+          if (session.id !== localSessionId) {
+            return session;
+          }
+
+          const existingIds = new Set(session.messages.map((message) => message.id));
+          const nextMessages = [...session.messages];
+          for (const commandEvent of commandEvents) {
+            const messageId = `command-${run.id}-${commandEvent.id}`;
+            if (existingIds.has(messageId)) {
+              continue;
+            }
+
+            nextMessages.push({
+              id: messageId,
+              role: "system",
+              content: serializeCommandEventMessage(commandEvent),
+              timestamp: formatTimestamp(run.finishedAt ?? run.startedAt)
+            });
+          }
+
+          return {
+            ...session,
+            updated: "Just now",
+            messages: nextMessages
+          };
+        })
+      }))
+    );
+  }
+
   function removeOptimisticMessage(localSessionId: string, optimisticId: string) {
     setWorkspaceTree((current) =>
       current.map((workspace) => ({
@@ -2323,6 +2534,58 @@ export default function App() {
     await loadSessionFile(options.sessionId, filePath);
   }
 
+  async function refreshLocalAgentRuns() {
+    const runs = await window.hawkcode.listLocalAgentRuns();
+    setLocalAgentRuns(runs);
+  }
+
+  async function finalizeLocalAgentRun(run: LocalAgentRun, pending: PendingLocalAgentRun) {
+    if (run.status === "succeeded" && run.content) {
+      const cleanedAssistantContent = stripEditorMarkers(run.content);
+      appendLocalRunCommandMessages(pending.localSessionId, run);
+      const commitResponse = await fetch(`${serverUrl.replace(/\/$/, "")}/agent/reply/commit`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({
+          provider: run.provider,
+          model: run.model,
+          sessionId: pending.serverSessionId,
+          message: pending.prompt,
+          assistantContent: cleanedAssistantContent,
+          toolCalls: run.toolCalls,
+          commandEvents: run.commandEvents
+        })
+      });
+
+      if (!commitResponse.ok) {
+        const errorBody = (await commitResponse.json().catch(() => null)) as
+          | { message?: string; error?: string }
+          | null;
+        throw new Error(errorBody?.message ?? errorBody?.error ?? "Agent request failed.");
+      }
+
+      const committed = (await commitResponse.json()) as AgentReplyResponse;
+      removeOptimisticMessage(pending.localSessionId, pending.optimisticId);
+      applyReplyToSession(pending.localSessionId, pending.prompt, committed);
+      await maybeOpenEditorFile({
+        content: run.content,
+        toolCalls: run.toolCalls,
+        sessionId: pending.serverSessionId,
+        worktreeRoot: pending.worktreeRoot ?? null
+      });
+      return;
+    }
+
+    removeOptimisticMessage(pending.localSessionId, pending.optimisticId);
+    appendLocalRunCommandMessages(pending.localSessionId, run);
+    if (run.status === "failed") {
+      setSendError(run.error ?? "Agent run failed.");
+    } else if (run.status === "cancelled") {
+      setSendError("Agent run stopped.");
+    }
+  }
+
   async function handleSend() {
     if (!selectedSession || !draft.trim() || !activeProvider) {
       return;
@@ -2334,6 +2597,7 @@ export default function App() {
         ? selectedModel
         : activeProvider.defaultModel;
     const modelSwitchNote = getModelSwitchNote(selectedSession, activeProvider, nextModel);
+    let localRunStarted = false;
     if (modelSwitchNote) {
       appendSessionNote(selectedSession.id, modelSwitchNote);
     }
@@ -2348,44 +2612,26 @@ export default function App() {
         activeProvider.name === "cursor" ||
         activeProvider.name === "gemini"
       ) {
-        const localResult = await window.hawkcode.generateLocalAgentReply({
+        const localRun = await window.hawkcode.startLocalAgentRun({
           provider: activeProvider.name,
           sessionId: selectedSession.id,
           model: nextModel,
           messages: buildLocalProviderMessages(prompt)
         });
-        const cleanedAssistantContent = stripEditorMarkers(localResult.content);
-
-        const commitResponse = await fetch(`${serverUrl.replace(/\/$/, "")}/agent/reply/commit`, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          credentials: "include",
-          body: JSON.stringify({
-            provider: localResult.provider,
-            model: localResult.model,
-            sessionId: selectedSession.serverSessionId,
-            message: prompt,
-            assistantContent: cleanedAssistantContent,
-            toolCalls: localResult.toolCalls
-          })
-        });
-
-        if (!commitResponse.ok) {
-          const errorBody = (await commitResponse.json().catch(() => null)) as
-            | { message?: string; error?: string }
-            | null;
-          throw new Error(errorBody?.message ?? errorBody?.error ?? "Agent request failed.");
-        }
-
-        const committed = (await commitResponse.json()) as AgentReplyResponse;
-        removeOptimisticMessage(selectedSession.id, optimisticId);
-        applyReplyToSession(selectedSession.id, prompt, committed);
-        await maybeOpenEditorFile({
-          content: localResult.content,
-          toolCalls: localResult.toolCalls,
-          sessionId: selectedSession.serverSessionId,
-          worktreeRoot: selectedSession.worktree?.path ?? null
-        });
+        setLocalAgentRuns((current) => [localRun, ...current.filter((run) => run.id !== localRun.id)]);
+        setPendingLocalAgentRuns((current) => [
+          ...current,
+          {
+            runId: localRun.id,
+            localSessionId: selectedSession.id,
+            serverSessionId: selectedSession.serverSessionId,
+            optimisticId,
+            prompt,
+            worktreeRoot: selectedSession.worktree?.path ?? null
+          }
+        ]);
+        setForegroundLocalRunId(localRun.id);
+        localRunStarted = true;
         return;
       }
 
@@ -2424,9 +2670,96 @@ export default function App() {
       setDraft(prompt);
       setSendError(error instanceof Error ? error.message : "Agent request failed.");
     } finally {
+      if (!localRunStarted) {
+        setIsSending(false);
+      }
+    }
+  }
+
+  async function handleStopLocalRun(runId: string) {
+    await window.hawkcode.stopLocalAgentRun(runId);
+    await refreshLocalAgentRuns();
+    if (foregroundLocalRunId === runId) {
+      setForegroundLocalRunId(null);
       setIsSending(false);
     }
   }
+
+  function handleBackgroundLocalRun() {
+    setForegroundLocalRunId(null);
+    setIsSending(false);
+  }
+
+  useEffect(() => {
+    void refreshLocalAgentRuns();
+  }, []);
+
+  useEffect(() => {
+    if (pendingLocalAgentRuns.length === 0) {
+      return;
+    }
+
+    void refreshLocalAgentRuns();
+    const timer = window.setInterval(() => {
+      void refreshLocalAgentRuns();
+    }, 1500);
+
+    return () => window.clearInterval(timer);
+  }, [pendingLocalAgentRuns.length]);
+
+  useEffect(() => {
+    const completedRuns = pendingLocalAgentRuns
+      .map((pending) => ({
+        pending,
+        run: localAgentRuns.find((candidate) => candidate.id === pending.runId)
+      }))
+      .filter(
+        (
+          entry
+        ): entry is { pending: PendingLocalAgentRun; run: LocalAgentRun } => {
+          const run = entry.run;
+          return (
+            run !== undefined &&
+            (run.status === "succeeded" ||
+              run.status === "failed" ||
+              run.status === "cancelled")
+          );
+        }
+      );
+
+    if (completedRuns.length === 0) {
+      return;
+    }
+
+    let cancelled = false;
+
+    void (async () => {
+      for (const entry of completedRuns) {
+        if (cancelled) {
+          return;
+        }
+
+        try {
+          await finalizeLocalAgentRun(entry.run, entry.pending);
+        } catch (error) {
+          removeOptimisticMessage(entry.pending.localSessionId, entry.pending.optimisticId);
+          setSendError(error instanceof Error ? error.message : "Agent request failed.");
+        } finally {
+          setPendingLocalAgentRuns((current) =>
+            current.filter((pending) => pending.runId !== entry.pending.runId)
+          );
+          if (foregroundLocalRunId === entry.pending.runId) {
+            setForegroundLocalRunId(null);
+            setIsSending(false);
+          }
+        }
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [foregroundLocalRunId, localAgentRuns, pendingLocalAgentRuns]);
 
   useEffect(() => {
     if (!githubAuth.inProgress || !githubAuth.deviceCode) {
@@ -2992,44 +3325,84 @@ export default function App() {
                   className="min-h-0 flex-1 overflow-y-auto overscroll-contain px-6 py-5"
                 >
                   <div className="mx-auto flex max-w-4xl flex-col gap-4 pb-8">
-                    {selectedSession.messages.map((message) => (
+                    {conversationFeed.map((item) => (
                       <div
-                        key={message.id}
+                        key={item.id}
                         className={`flex ${
-                          message.role === "system"
+                          item.kind === "command"
+                            ? "justify-start"
+                            : item.role === "system"
                             ? "justify-center"
-                            : message.role === "user"
+                            : item.role === "user"
                               ? "justify-end"
                               : "justify-start"
                         }`}
                       >
                         <div
                           className={`max-w-3xl rounded-3xl px-4 py-3 ${
-                            message.role === "system"
+                            item.kind === "command"
+                              ? "border border-amber-300/40 bg-amber-50 text-amber-950"
+                              : item.role === "system"
                               ? "border border-dashed border-border bg-background text-muted-foreground"
-                              : message.role === "user"
+                              : item.role === "user"
                               ? "bg-primary text-primary-foreground"
                               : "border border-border bg-card"
                           }`}
                         >
                           <div className="mb-2 flex items-center gap-2 text-[11px] uppercase tracking-[0.18em] opacity-70">
                             <span>
-                              {message.role === "system"
+                              {item.kind === "command"
+                                ? "Command"
+                                : item.role === "system"
                                 ? "Session note"
-                                : message.role === "user"
+                                : item.role === "user"
                                   ? "You"
                                   : "Assistant"}
                             </span>
-                            <span>{message.timestamp}</span>
+                            <span>{item.timestamp}</span>
                           </div>
-                          <div className="space-y-3">
-                            {renderMessageContent(
-                              message.content,
-                              message.id,
-                              copiedCodeId,
-                              handleCopyCode
-                            )}
-                          </div>
+                          {item.kind === "command" ? (
+                            <details
+                              className="group"
+                              open={item.status === "running"}
+                            >
+                              <summary className="flex cursor-pointer list-none items-start justify-between gap-3 marker:hidden">
+                                <div className="min-w-0">
+                                  <div className="truncate font-mono text-[12px] leading-6">
+                                    {item.command}
+                                  </div>
+                                  <div className="text-[11px] uppercase tracking-[0.16em] opacity-70">
+                                    {item.status}
+                                    {item.exitCode !== undefined && item.exitCode !== null
+                                      ? ` · exit ${item.exitCode}`
+                                      : ""}
+                                  </div>
+                                </div>
+                                <div className="pt-0.5 text-[11px] uppercase tracking-[0.16em] opacity-60 group-open:hidden">
+                                  Expand
+                                </div>
+                                <div className="pt-0.5 text-[11px] uppercase tracking-[0.16em] opacity-60 hidden group-open:block">
+                                  Collapse
+                                </div>
+                              </summary>
+                              {item.output.trim() ? (
+                                <pre className="mt-3 overflow-x-auto whitespace-pre-wrap rounded-2xl border border-amber-300/30 bg-white/50 p-3 font-mono text-[11px] leading-5">
+                                  {summarizeCommandOutput(item.output)}
+                                </pre>
+                              ) : (
+                                <div className="mt-3 text-[11px] opacity-70">No output.</div>
+                              )}
+                            </details>
+                          ) : (
+                            <div className="space-y-3">
+                              {renderMessageContent(
+                                item.content,
+                                item.id,
+                                copiedCodeId,
+                                handleCopyCode
+                              )}
+                            </div>
+                          )}
                         </div>
                       </div>
                     ))}
@@ -3400,7 +3773,9 @@ export default function App() {
                   <div className="mt-3 flex items-center justify-between gap-3">
                     <div className="space-y-1 text-xs text-muted-foreground">
                       <div>
-                        {activeProvider
+                        {foregroundLocalRun
+                          ? `${formatRunStatus(foregroundLocalRun.status)} ${foregroundLocalRun.provider} · ${foregroundLocalRun.model}`
+                          : activeProvider
                           ? `Using ${activeProvider?.label ?? "agent"}${selectedModel ? ` · ${selectedModel}` : ""} for this reply.`
                           : geminiSetupSelected
                             ? "Gemini CLI is selected but not installed yet."
@@ -3412,7 +3787,11 @@ export default function App() {
                             ? "Cursor CLI is installed, but login is required."
                           : "No agent providers available yet."}
                       </div>
-                      <div>Enter sends. Shift+Enter adds a new line.</div>
+                      <div>
+                        {foregroundLocalRun
+                          ? "This run is live. Stop it or send it to the background."
+                          : "Enter sends. Shift+Enter adds a new line."}
+                      </div>
                     </div>
                     <div className="flex items-center gap-2">
                       <select
@@ -3460,6 +3839,20 @@ export default function App() {
                       >
                         Clear
                       </Button>
+                      {foregroundLocalRun ? (
+                        <>
+                          <Button size="sm" variant="outline" onClick={handleBackgroundLocalRun}>
+                            Background
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() => void handleStopLocalRun(foregroundLocalRun.id)}
+                          >
+                            Stop
+                          </Button>
+                        </>
+                      ) : null}
                       <Button
                         size="sm"
                         disabled={
@@ -3890,19 +4283,93 @@ export default function App() {
             <TabsContent value="activity">
               <Card>
                 <CardHeader>
-                  <CardTitle>Recent activity</CardTitle>
-                  <CardDescription>Latest work on the selected session.</CardDescription>
+                  <CardTitle>Agent Runs</CardTitle>
+                  <CardDescription>Foreground and background local provider runs for this session.</CardDescription>
                 </CardHeader>
                 <CardContent className="space-y-3 text-xs text-muted-foreground">
-                  <div className="rounded-lg border border-border px-3 py-2">
-                    2m ago · Session state synced to workspace server
-                  </div>
-                  <div className="rounded-lg border border-border px-3 py-2">
-                    11m ago · Context bundle updated with auth routes
-                  </div>
-                  <div className="rounded-lg border border-border px-3 py-2">
-                    42m ago · Desktop branch rebased onto `main`
-                  </div>
+                  {sessionLocalRuns.length > 0 ? (
+                    sessionLocalRuns.map((run) => {
+                      const logSummary = summarizeRunLog(run.stdout, run.stderr);
+                      const latestCommand = run.commandEvents?.[run.commandEvents.length - 1] ?? null;
+                      const latestCommandOutput = latestCommand
+                        ? summarizeCommandOutput(latestCommand.output)
+                        : "";
+
+                      return (
+                        <div key={run.id} className="rounded-lg border border-border px-3 py-3">
+                          <div className="flex items-start justify-between gap-3">
+                            <div>
+                              <div className="font-medium text-foreground">
+                                {run.provider} · {run.model}
+                              </div>
+                              <div className="mt-1">
+                                {formatRunStatus(run.status)} · started {formatTimestamp(run.startedAt)}
+                                {run.finishedAt ? ` · finished ${formatTimestamp(run.finishedAt)}` : ""}
+                              </div>
+                            </div>
+                            <div className="flex gap-2">
+                              {run.status === "queued" || run.status === "running" ? (
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  onClick={() => void handleStopLocalRun(run.id)}
+                                >
+                                  Stop
+                                </Button>
+                              ) : null}
+                              {foregroundLocalRunId !== run.id &&
+                              (run.status === "queued" || run.status === "running") ? (
+                                <Button
+                                  size="sm"
+                                  variant="outline"
+                                  onClick={() => {
+                                    setForegroundLocalRunId(run.id);
+                                    setIsSending(true);
+                                  }}
+                                >
+                                  Focus
+                                </Button>
+                              ) : null}
+                              {foregroundLocalRunId === run.id ? (
+                                <Button size="sm" variant="outline" onClick={handleBackgroundLocalRun}>
+                                  Background
+                                </Button>
+                              ) : null}
+                            </div>
+                          </div>
+                          <div className="mt-2 line-clamp-3">{run.prompt}</div>
+                          {latestCommand ? (
+                            <div className="mt-2 rounded-md border border-border bg-background/60 px-2 py-2">
+                              <div className="font-mono text-[11px] text-foreground">{latestCommand.command}</div>
+                              <div className="mt-1">
+                                {latestCommand.status}
+                                {latestCommand.exitCode !== undefined && latestCommand.exitCode !== null
+                                  ? ` · exit ${latestCommand.exitCode}`
+                                  : ""}
+                              </div>
+                              {latestCommandOutput ? (
+                                <pre className="mt-2 overflow-x-auto whitespace-pre-wrap font-mono text-[11px] text-muted-foreground">
+                                  {latestCommandOutput}
+                                </pre>
+                              ) : null}
+                            </div>
+                          ) : null}
+                          {run.error ? (
+                            <div className="mt-2 text-destructive">{run.error}</div>
+                          ) : null}
+                          {logSummary ? (
+                            <pre className="mt-2 overflow-x-auto rounded-md border border-border bg-background/70 p-2 font-mono text-[11px] text-muted-foreground">
+                              {logSummary}
+                            </pre>
+                          ) : null}
+                        </div>
+                      );
+                    })
+                  ) : (
+                    <div className="rounded-lg border border-dashed border-border px-3 py-2">
+                      No local agent runs yet.
+                    </div>
+                  )}
                 </CardContent>
               </Card>
             </TabsContent>

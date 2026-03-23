@@ -52,9 +52,17 @@ export const agentToolCallSchema = z.object({
   durationMs: z.number().int().nonnegative().optional()
 });
 
+export const agentCommandEventSchema = z.object({
+  command: z.string().min(1),
+  status: z.enum(["running", "completed", "failed"]),
+  output: z.string(),
+  exitCode: z.number().int().nullable().optional()
+});
+
 export const agentCommitReplyRequestSchema = agentReplyRequestSchema.extend({
   assistantContent: z.string().min(1),
-  toolCalls: z.array(agentToolCallSchema).optional()
+  toolCalls: z.array(agentToolCallSchema).optional(),
+  commandEvents: z.array(agentCommandEventSchema).optional()
 });
 
 export const agentReplyResponseSchema = z.object({
@@ -73,6 +81,7 @@ export type AgentChatRole = z.infer<typeof agentChatRoleSchema>;
 export type AgentChatMessage = z.infer<typeof agentChatMessageSchema>;
 export type AgentProviderInfo = z.infer<typeof agentProviderInfoSchema>;
 export type AgentToolCall = z.infer<typeof agentToolCallSchema>;
+export type AgentCommandEvent = z.infer<typeof agentCommandEventSchema>;
 export type AgentReplyRequest = z.infer<typeof agentReplyRequestSchema>;
 export type AgentCommitReplyRequest = z.infer<typeof agentCommitReplyRequestSchema>;
 export type AgentReplyResponse = z.infer<typeof agentReplyResponseSchema>;

@@ -14,10 +14,12 @@ contextBridge.exposeInMainWorld("hawkcode", {
   startCodexAuth: () => ipcRenderer.invoke("hawkcode:start-codex-auth"),
   startCursorCliAuth: () => ipcRenderer.invoke("hawkcode:start-cursor-cli-auth"),
   openExternalUrl: (url: string) => ipcRenderer.invoke("hawkcode:open-external-url", url),
-  generateLocalAgentReply: (payload: {
+  startLocalAgentRun: (payload: {
     provider: "codex" | "cursor" | "gemini";
     sessionId?: string;
     messages: Array<{ role: string; content: string }>;
     model?: string;
-  }) => ipcRenderer.invoke("hawkcode:generate-local-agent-reply", payload)
+  }) => ipcRenderer.invoke("hawkcode:start-local-agent-run", payload),
+  listLocalAgentRuns: () => ipcRenderer.invoke("hawkcode:list-local-agent-runs"),
+  stopLocalAgentRun: (runId: string) => ipcRenderer.invoke("hawkcode:stop-local-agent-run", runId)
 });

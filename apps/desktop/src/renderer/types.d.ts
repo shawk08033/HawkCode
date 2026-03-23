@@ -47,10 +47,26 @@ type CodexGeneratePayload = {
   model?: string;
 };
 
-type CodexGenerateResult = {
+type LocalAgentRun = {
+  id: string;
   provider: "codex" | "cursor" | "gemini";
+  sessionId?: string;
   model: string;
-  content: string;
+  status: "queued" | "running" | "succeeded" | "failed" | "cancelled";
+  startedAt: string;
+  finishedAt?: string;
+  prompt: string;
+  content?: string;
+  error?: string;
+  stdout: string;
+  stderr: string;
+  commandEvents?: Array<{
+    id: string;
+    command: string;
+    status: "running" | "completed" | "failed";
+    output: string;
+    exitCode?: number | null;
+  }>;
   toolCalls?: Array<{
     name: string;
     input?: string;
@@ -74,7 +90,9 @@ declare global {
       startCodexAuth: () => Promise<CodexAuthStatus>;
       startCursorCliAuth: () => Promise<CursorCliStatus>;
       openExternalUrl: (url: string) => Promise<{ ok: boolean }>;
-      generateLocalAgentReply: (payload: CodexGeneratePayload) => Promise<CodexGenerateResult>;
+      startLocalAgentRun: (payload: CodexGeneratePayload) => Promise<LocalAgentRun>;
+      listLocalAgentRuns: () => Promise<LocalAgentRun[]>;
+      stopLocalAgentRun: (runId: string) => Promise<{ ok: boolean }>;
     };
   }
 }

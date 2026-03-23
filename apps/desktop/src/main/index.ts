@@ -1,7 +1,7 @@
 import { app, BrowserWindow, ipcMain, net, session, shell } from "electron";
 import path from "node:path";
 import fs from "node:fs";
-import { execFile, execFileSync, spawn } from "node:child_process";
+import { execFile, execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { createRequire } from "node:module";
 import { homedir, userInfo } from "node:os";
 import { promisify } from "node:util";
@@ -40,6 +40,39 @@ type AgentToolCall = {
 };
 
 type JsonRecord = Record<string, unknown>;
+
+type LocalAgentRunStatus = "queued" | "running" | "succeeded" | "failed" | "cancelled";
+
+type LocalAgentCommandStatus = "running" | "completed" | "failed";
+
+type LocalAgentCommandRecord = {
+  id: string;
+  command: string;
+  status: LocalAgentCommandStatus;
+  output: string;
+  exitCode?: number | null;
+};
+
+type LocalAgentRunRecord = {
+  id: string;
+  provider: "codex" | "cursor" | "gemini";
+  sessionId?: string;
+  model: string;
+  status: LocalAgentRunStatus;
+  startedAt: string;
+  finishedAt?: string;
+  prompt: string;
+  content?: string;
+  error?: string;
+  stdout: string;
+  stderr: string;
+  toolCalls?: AgentToolCall[];
+  commandEvents?: LocalAgentCommandRecord[];
+};
+
+type LocalAgentRunState = LocalAgentRunRecord & {
+  child?: ChildProcess;
+};
 
 const store = new Store<StoreShape>({
   defaults: {
@@ -98,6 +131,8 @@ let cursorCliState: {
   command: null,
   statusText: "Cursor CLI not found"
 };
+const localAgentRuns = new Map<string, LocalAgentRunState>();
+const maxStoredLocalAgentRuns = 20;
 
 function extractFirstUrl(value: string) {
   return value.match(/https?:\/\/\S+/)?.[0];
@@ -109,6 +144,63 @@ function extractDeviceCode(value: string) {
 
 function stripAnsi(value: string) {
   return value.replace(/\u001B\[[0-?]*[ -/]*[@-~]/g, "");
+}
+
+function createLocalAgentRunId() {
+  return `run_${Date.now()}_${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function trimLog(value: string) {
+  const maxLength = 24000;
+  return value.length > maxLength ? value.slice(value.length - maxLength) : value;
+}
+
+function toIsoNow() {
+  return new Date().toISOString();
+}
+
+function serializeLocalAgentRun(run: LocalAgentRunState): LocalAgentRunRecord {
+  return {
+    id: run.id,
+    provider: run.provider,
+    sessionId: run.sessionId,
+    model: run.model,
+    status: run.status,
+    startedAt: run.startedAt,
+    finishedAt: run.finishedAt,
+    prompt: run.prompt,
+    content: run.content,
+    error: run.error,
+    stdout: run.stdout,
+    stderr: run.stderr,
+    toolCalls: run.toolCalls,
+    commandEvents: run.commandEvents
+  };
+}
+
+function rememberLocalAgentRun(run: LocalAgentRunState) {
+  localAgentRuns.delete(run.id);
+  localAgentRuns.set(run.id, run);
+  while (localAgentRuns.size > maxStoredLocalAgentRuns) {
+    const oldestKey = localAgentRuns.keys().next().value;
+    if (!oldestKey) {
+      break;
+    }
+    localAgentRuns.delete(oldestKey);
+  }
+}
+
+function updateLocalAgentRun(
+  runId: string,
+  updater: (current: LocalAgentRunState) => void
+) {
+  const run = localAgentRuns.get(runId);
+  if (!run) {
+    return;
+  }
+
+  updater(run);
+  rememberLocalAgentRun(run);
 }
 
 function getResolvedGeminiCommand() {
@@ -523,6 +615,149 @@ function extractGeminiToolCalls(events: JsonRecord[]) {
   return toolCalls;
 }
 
+function extractGeminiText(events: JsonRecord[]) {
+  const assistantMessages = events
+    .filter((event) => event.type === "message" && event.role === "assistant")
+    .flatMap((event) => (typeof event.content === "string" ? [event.content] : []));
+
+  if (assistantMessages.length === 0) {
+    return "";
+  }
+
+  const lastMessage = assistantMessages[assistantMessages.length - 1]?.trim() ?? "";
+  if (!lastMessage) {
+    return "";
+  }
+
+  return lastMessage;
+}
+
+function applyCodexEventToRun(runId: string, event: JsonRecord) {
+  const item = event.item;
+  if (!item || typeof item !== "object" || Array.isArray(item)) {
+    return;
+  }
+
+  const itemRecord = item as JsonRecord;
+  if (itemRecord.type !== "command_execution" || typeof itemRecord.id !== "string") {
+    return;
+  }
+
+  const itemId = itemRecord.id;
+  const command = typeof itemRecord.command === "string" ? itemRecord.command : "command";
+  const output =
+    typeof itemRecord.aggregated_output === "string" ? itemRecord.aggregated_output : "";
+  const exitCode = typeof itemRecord.exit_code === "number" ? itemRecord.exit_code : null;
+  const status =
+    event.type === "item.started"
+      ? "running"
+      : exitCode === 0
+        ? "completed"
+        : "failed";
+
+  updateLocalAgentRun(runId, (run) => {
+    const currentEvents = [...(run.commandEvents ?? [])];
+    const existingIndex = currentEvents.findIndex((entry) => entry.id === itemId);
+    const nextEvent: LocalAgentCommandRecord = {
+      id: itemId,
+      command,
+      status,
+      output: trimLog(output),
+      exitCode
+    };
+
+    if (existingIndex >= 0) {
+      currentEvents[existingIndex] = nextEvent;
+    } else {
+      currentEvents.push(nextEvent);
+    }
+
+    run.commandEvents = currentEvents;
+  });
+}
+
+async function runManagedCommand(options: {
+  runId: string;
+  command: string;
+  args: string[];
+  env: NodeJS.ProcessEnv;
+  onStdoutChunk?: (value: string) => void;
+}) {
+  return await new Promise<{ stdout: string; stderr: string }>((resolve, reject) => {
+    const child = spawn(options.command, options.args, {
+      cwd: process.cwd(),
+      env: options.env,
+      stdio: ["ignore", "pipe", "pipe"]
+    });
+
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+
+    updateLocalAgentRun(options.runId, (run) => {
+      run.child = child;
+      if (run.status === "queued") {
+        run.status = "running";
+      }
+    });
+
+    child.stdout?.on("data", (chunk: Buffer | string) => {
+      const value = chunk.toString();
+      stdout += value;
+      options.onStdoutChunk?.(value);
+      updateLocalAgentRun(options.runId, (run) => {
+        run.stdout = trimLog(run.stdout + value);
+      });
+    });
+
+    child.stderr?.on("data", (chunk: Buffer | string) => {
+      const value = chunk.toString();
+      stderr += value;
+      updateLocalAgentRun(options.runId, (run) => {
+        run.stderr = trimLog(run.stderr + value);
+      });
+    });
+
+    child.on("error", (error) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      updateLocalAgentRun(options.runId, (run) => {
+        run.child = undefined;
+      });
+      reject(error);
+    });
+
+    child.on("close", (code, signal) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      const run = localAgentRuns.get(options.runId);
+      updateLocalAgentRun(options.runId, (current) => {
+        current.child = undefined;
+      });
+
+      if (run?.status === "cancelled" || signal === "SIGTERM" || signal === "SIGINT") {
+        reject(new Error("run_cancelled"));
+        return;
+      }
+
+      if (code !== 0) {
+        reject(
+          new Error(
+            stripAnsi(`${stderr}\n${stdout}`).trim() || `Process exited with code ${code ?? "unknown"}.`
+          )
+        );
+        return;
+      }
+
+      resolve({ stdout, stderr });
+    });
+  });
+}
+
 async function getCodexAuthStatus() {
   try {
     const result = await execFileAsync(codexCommand, ["login", "status"], {
@@ -660,12 +895,20 @@ async function getGeminiCliStatus() {
   return geminiCliState;
 }
 
-async function generateCodexReply(messages: Array<{ role: string; content: string }>, model = "gpt-5") {
+async function generateCodexReply(
+  runId: string,
+  messages: Array<{ role: string; content: string }>,
+  model = "gpt-5"
+) {
   const prompt = buildCliPrompt("Codex", messages);
   let stdout = "";
+  let eventBuffer = "";
 
   try {
-    const result = await execFileAsync(codexCommand, [
+    const result = await runManagedCommand({
+      runId,
+      command: codexCommand,
+      args: [
       "exec",
       "--skip-git-repo-check",
       "--full-auto",
@@ -673,9 +916,25 @@ async function generateCodexReply(messages: Array<{ role: string; content: strin
       "-m",
       model,
       prompt
-    ], {
-      cwd: process.cwd(),
-      env: process.env
+      ],
+      env: process.env,
+      onStdoutChunk: (value) => {
+        eventBuffer += value;
+        const lines = eventBuffer.split(/\r?\n/);
+        eventBuffer = lines.pop() ?? "";
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed) {
+            continue;
+          }
+
+          try {
+            applyCodexEventToRun(runId, JSON.parse(trimmed) as JsonRecord);
+          } catch {
+            continue;
+          }
+        }
+      }
     });
     stdout = result.stdout;
   } catch (error) {
@@ -711,6 +970,7 @@ async function generateCodexReply(messages: Array<{ role: string; content: strin
 }
 
 async function generateGeminiReply(
+  runId: string,
   sessionId: string | undefined,
   messages: Array<{ role: string; content: string }>,
   model = defaultGeminiModel
@@ -741,8 +1001,10 @@ async function generateGeminiReply(
   let stdout = "";
   let stderr = "";
   try {
-    const result = await execFileAsync(resolvedCommand, args, {
-      cwd: process.cwd(),
+    const result = await runManagedCommand({
+      runId,
+      command: resolvedCommand,
+      args,
       env: getGeminiEnv()
     });
     stdout = result.stdout;
@@ -760,8 +1022,10 @@ async function generateGeminiReply(
         ...(model && model.trim().length > 0 && model !== "auto" ? ["-m", model] : [])
       ];
       try {
-        const retryResult = await execFileAsync(resolvedCommand, retryArgs, {
-          cwd: process.cwd(),
+        const retryResult = await runManagedCommand({
+          runId,
+          command: resolvedCommand,
+          args: retryArgs,
           env: getGeminiEnv()
         });
         stdout = retryResult.stdout;
@@ -782,17 +1046,17 @@ async function generateGeminiReply(
     extractJsonObject(stdout) ??
     extractJsonObject(stderr) ??
     extractJsonObject(`${stdout}\n${stderr}`);
-  if (!payload || typeof payload !== "object") {
-    throw new Error("Gemini CLI returned invalid JSON.");
-  }
-  const parsedPayload = payload as { response?: string; session_id?: string };
+  const parsedPayload =
+    payload && typeof payload === "object"
+      ? (payload as { response?: string; session_id?: string })
+      : null;
 
-  const content = parsedPayload.response?.trim() ?? "";
+  const content = parsedPayload?.response?.trim() || extractGeminiText(events);
   if (!content) {
     throw new Error("Gemini CLI returned an empty response.");
   }
 
-  if (sessionId && !resumeSessionId && parsedPayload.session_id?.trim()) {
+  if (sessionId && !resumeSessionId && parsedPayload?.session_id?.trim()) {
     setGeminiResumeSessionId(sessionId, parsedPayload.session_id.trim());
   }
 
@@ -968,6 +1232,7 @@ function startCursorCliAuth() {
 }
 
 async function generateCursorReply(
+  runId: string,
   sessionId: string | undefined,
   messages: Array<{ role: string; content: string }>,
   model = defaultCursorModel
@@ -986,6 +1251,7 @@ async function generateCursorReply(
     "--output-format",
     "stream-json",
     "--trust",
+    "--force",
     "--approve-mcps"
   ];
   if (chatId) {
@@ -998,8 +1264,10 @@ async function generateCursorReply(
 
   let stdout: string;
   try {
-    const result = await execFileAsync(cursorCommand, args, {
-      cwd: process.cwd(),
+    const result = await runManagedCommand({
+      runId,
+      command: cursorCommand,
+      args,
       env: getCursorEnv(cursorCommand)
     });
     stdout = result.stdout;
@@ -1012,14 +1280,17 @@ async function generateCursorReply(
         "--output-format",
         "stream-json",
         "--trust",
+        "--force",
         "--approve-mcps",
         ...(retryChatId ? ["--resume", retryChatId] : []),
         ...(model && model.trim().length > 0 && model !== "auto" ? ["-m", model] : []),
         prompt
       ];
       try {
-        const retryResult = await execFileAsync(cursorCommand, retryArgs, {
-          cwd: process.cwd(),
+        const retryResult = await runManagedCommand({
+          runId,
+          command: cursorCommand,
+          args: retryArgs,
           env: getCursorEnv(cursorCommand)
         });
         stdout = retryResult.stdout;
@@ -1086,6 +1357,100 @@ async function getDesktopAgentProviders() {
   }
 
   return providers;
+}
+
+async function executeLocalAgentRun(runId: string, payload: {
+  provider: "codex" | "cursor" | "gemini";
+  sessionId?: string;
+  messages: Array<{ role: string; content: string }>;
+  model?: string;
+}) {
+  try {
+    const result =
+      payload.provider === "codex"
+        ? await generateCodexReply(runId, payload.messages, payload.model)
+        : payload.provider === "gemini"
+          ? await generateGeminiReply(runId, payload.sessionId, payload.messages, payload.model)
+          : await generateCursorReply(runId, payload.sessionId, payload.messages, payload.model);
+
+    updateLocalAgentRun(runId, (run) => {
+      if (run.status === "cancelled") {
+        run.finishedAt = run.finishedAt ?? toIsoNow();
+        return;
+      }
+      run.status = "succeeded";
+      run.finishedAt = toIsoNow();
+      run.model = result.model;
+      run.content = result.content;
+      run.toolCalls = result.toolCalls;
+    });
+  } catch (error) {
+    updateLocalAgentRun(runId, (run) => {
+      if (run.status === "cancelled" || (error instanceof Error && error.message === "run_cancelled")) {
+        run.status = "cancelled";
+        run.finishedAt = run.finishedAt ?? toIsoNow();
+        run.error = undefined;
+        return;
+      }
+      run.status = "failed";
+      run.finishedAt = toIsoNow();
+      run.error = error instanceof Error ? error.message : "Agent run failed.";
+    });
+  }
+}
+
+function startLocalAgentRun(payload: {
+  provider: "codex" | "cursor" | "gemini";
+  sessionId?: string;
+  messages: Array<{ role: string; content: string }>;
+  model?: string;
+}) {
+  const prompt = payload.messages[payload.messages.length - 1]?.content?.trim() ?? "";
+  const run: LocalAgentRunState = {
+    id: createLocalAgentRunId(),
+    provider: payload.provider,
+    sessionId: payload.sessionId,
+    model:
+      payload.model?.trim() ||
+      (payload.provider === "codex"
+        ? "gpt-5"
+        : payload.provider === "cursor"
+          ? defaultCursorModel
+          : defaultGeminiModel),
+    status: "queued",
+    startedAt: toIsoNow(),
+    prompt,
+    stdout: "",
+    stderr: "",
+    commandEvents: []
+  };
+
+  rememberLocalAgentRun(run);
+  void executeLocalAgentRun(run.id, payload);
+  return serializeLocalAgentRun(run);
+}
+
+function listLocalAgentRunRecords() {
+  return [...localAgentRuns.values()]
+    .map((run) => serializeLocalAgentRun(run))
+    .sort((left, right) => right.startedAt.localeCompare(left.startedAt));
+}
+
+function stopLocalAgentRun(runId: string) {
+  const run = localAgentRuns.get(runId);
+  if (!run) {
+    return { ok: false };
+  }
+
+  if (run.status === "succeeded" || run.status === "failed" || run.status === "cancelled") {
+    return { ok: true };
+  }
+
+  run.status = "cancelled";
+  run.finishedAt = toIsoNow();
+  run.child?.kill("SIGTERM");
+  rememberLocalAgentRun(run);
+  return { ok: true };
 }
 
 async function getDesktopAgentProviderDebug() {
@@ -1256,17 +1621,16 @@ app.whenReady().then(() => {
     return { ok: true };
   });
 
-  ipcMain.handle("hawkcode:generate-local-agent-reply", async (_event, payload) => {
-    if (payload.provider === "codex") {
-      return generateCodexReply(payload.messages, payload.model);
-    }
-    if (payload.provider === "gemini") {
-      return generateGeminiReply(payload.sessionId, payload.messages, payload.model);
-    }
-    if (payload.provider === "cursor") {
-      return generateCursorReply(payload.sessionId, payload.messages, payload.model);
-    }
-    throw new Error(`Unsupported local provider: ${payload.provider as string}`);
+  ipcMain.handle("hawkcode:start-local-agent-run", async (_event, payload) => {
+    return startLocalAgentRun(payload);
+  });
+
+  ipcMain.handle("hawkcode:list-local-agent-runs", async () => {
+    return listLocalAgentRunRecords();
+  });
+
+  ipcMain.handle("hawkcode:stop-local-agent-run", async (_event, runId: string) => {
+    return stopLocalAgentRun(runId);
   });
 
   createWindow();
