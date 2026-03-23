@@ -253,7 +253,9 @@ function buildSessionRecord(session: {
   const lastMessage = session.messages[session.messages.length - 1];
   const lastActivity = lastMessage?.createdAt ?? session.createdAt;
   const latestRun = session.agentRuns[0];
-  const latestToolCall = latestRun?.toolCalls[0];
+  const latestToolCall = latestRun?.toolCalls.find((toolCall) => {
+    return toolCall.input.includes("\"provider\"") && toolCall.input.includes("\"model\"");
+  });
   const sessionWorktree = session.sessionWorktree ?? null;
   const providerInfo = parseToolCallInput(latestToolCall?.input);
 
@@ -653,7 +655,15 @@ export async function registerWorkspaceRoutes(server: FastifyInstance) {
               },
               take: 1,
               include: {
-                toolCalls: true
+                toolCalls: {
+                  where: {
+                    name: "generate_reply"
+                  },
+                  orderBy: {
+                    id: "desc"
+                  },
+                  take: 1
+                }
               }
             }
           }
@@ -1160,7 +1170,15 @@ export async function registerWorkspaceRoutes(server: FastifyInstance) {
             },
             take: 1,
             include: {
-              toolCalls: true
+              toolCalls: {
+                where: {
+                  name: "generate_reply"
+                },
+                orderBy: {
+                  id: "desc"
+                },
+                take: 1
+              }
             }
           }
         }
@@ -1780,7 +1798,15 @@ export async function registerWorkspaceRoutes(server: FastifyInstance) {
           },
           take: 1,
           include: {
-            toolCalls: true
+            toolCalls: {
+              where: {
+                name: "generate_reply"
+              },
+              orderBy: {
+                id: "desc"
+              },
+              take: 1
+            }
           }
         }
       }

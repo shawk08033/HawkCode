@@ -100,6 +100,13 @@ type AgentReplyResponse = {
   };
 };
 
+type AgentToolCall = {
+  name: string;
+  input?: string;
+  output?: string;
+  durationMs?: number;
+};
+
 type CodexAuthStatus = {
   loggedIn: boolean;
   inProgress: boolean;
@@ -464,6 +471,14 @@ const CURSOR_SETUP_PROVIDER: ProviderInfo = {
   defaultModel: "auto"
 };
 
+const OPEN_FILE_MARKER_PATTERN = /\[\[open_file:([^\]\n]+)\]\]/i;
+const EDITOR_ASSISTANT_SYSTEM_PROMPT = [
+  "You are inside HawkCode.",
+  "If the user asks you to open, inspect, or focus a specific file in the HawkCode editor, append exactly one line in this format at the end of your reply: [[open_file:relative/path/to/file]]",
+  "Only include that marker when you can identify a specific repo-relative file path with confidence.",
+  "Do not mention the marker in normal prose."
+].join("\n");
+
 const GEMINI_SETUP_PROVIDER: ProviderInfo = {
   name: "gemini",
   label: "Gemini CLI (setup required)",
@@ -498,6 +513,123 @@ function getModelOptions(provider?: ProviderInfo | null) {
     "anthropic/claude-sonnet-4",
     "google/gemini-2.5-pro"
   ].filter((value, index, all) => all.indexOf(value) === index);
+}
+
+function parseJsonRecord(value?: string) {
+  if (!value) {
+    return null;
+  }
+
+  try {
+    return JSON.parse(value) as Record<string, unknown>;
+  } catch {
+    return null;
+  }
+}
+
+function findPathCandidate(value: unknown): string | null {
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+    return trimmed;
+  }
+
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return null;
+  }
+
+  const record = value as Record<string, unknown>;
+  for (const key of ["path", "filePath", "file_path", "filepath", "relativePath", "relative_path", "target", "file"]) {
+    const candidate = record[key];
+    if (typeof candidate === "string" && candidate.trim()) {
+      return candidate.trim();
+    }
+  }
+
+  for (const nested of Object.values(record)) {
+    const candidate = findPathCandidate(nested);
+    if (candidate) {
+      return candidate;
+    }
+  }
+
+  return null;
+}
+
+function normalizeEditorFilePath(candidate: string, worktreeRoot?: string | null) {
+  let normalized = candidate.trim().replace(/^["'`]+|["'`]+$/g, "");
+  if (!normalized) {
+    return null;
+  }
+
+  const markerMatch = normalized.match(OPEN_FILE_MARKER_PATTERN);
+  if (markerMatch) {
+    normalized = markerMatch[1]?.trim() ?? "";
+  }
+
+  normalized = normalized.replace(/\\/g, "/").replace(/^\.\/+/, "");
+  if (!normalized || normalized.includes("://")) {
+    return null;
+  }
+
+  if (worktreeRoot) {
+    const normalizedRoot = worktreeRoot.replace(/\\/g, "/").replace(/\/$/, "");
+    if (normalized.startsWith(`${normalizedRoot}/`)) {
+      normalized = normalized.slice(normalizedRoot.length + 1);
+    }
+  }
+
+  normalized = normalized.replace(/^\/+/, "");
+  if (
+    !normalized ||
+    normalized.endsWith("/") ||
+    normalized.split("/").some((segment) => segment === ".." || segment.length === 0)
+  ) {
+    return null;
+  }
+
+  return normalized;
+}
+
+function getEditorFileFromAssistantContent(content: string, worktreeRoot?: string | null) {
+  const markerMatch = content.match(OPEN_FILE_MARKER_PATTERN);
+  if (!markerMatch?.[1]) {
+    return null;
+  }
+
+  return normalizeEditorFilePath(markerMatch[1], worktreeRoot);
+}
+
+function getEditorFileFromToolCalls(toolCalls: AgentToolCall[] | undefined, worktreeRoot?: string | null) {
+  for (const toolCall of toolCalls ?? []) {
+    if (!/(open|read|view|file)/i.test(toolCall.name)) {
+      continue;
+    }
+
+    const inputRecord = parseJsonRecord(toolCall.input);
+    const outputRecord = parseJsonRecord(toolCall.output);
+    const candidate =
+      findPathCandidate(inputRecord) ??
+      findPathCandidate(outputRecord) ??
+      findPathCandidate(toolCall.input) ??
+      findPathCandidate(toolCall.output);
+    if (!candidate) {
+      continue;
+    }
+
+    const normalized = normalizeEditorFilePath(candidate, worktreeRoot);
+    if (normalized) {
+      return normalized;
+    }
+  }
+
+  return null;
+}
+
+function stripEditorMarkers(content: string) {
+  return content.replace(/\n?\s*\[\[open_file:[^\]\n]+\]\]\s*$/i, "").trim();
 }
 
 function parseMessageContent(content: string): MessageSegment[] {
@@ -2158,6 +2290,10 @@ export default function App() {
     const selectedContext = buildLocalSelectionContextMessage();
 
     return [
+      {
+        role: "system" as const,
+        content: EDITOR_ASSISTANT_SYSTEM_PROMPT
+      },
       ...recentConversation,
       ...(selectedContext ? [selectedContext] : []),
       {
@@ -2165,6 +2301,26 @@ export default function App() {
         content: prompt
       }
     ];
+  }
+
+  async function maybeOpenEditorFile(options: {
+    content: string;
+    toolCalls?: AgentToolCall[];
+    sessionId?: string;
+    worktreeRoot?: string | null;
+  }) {
+    if (!options.sessionId) {
+      return;
+    }
+
+    const filePath =
+      getEditorFileFromAssistantContent(options.content, options.worktreeRoot) ??
+      getEditorFileFromToolCalls(options.toolCalls, options.worktreeRoot);
+    if (!filePath) {
+      return;
+    }
+
+    await loadSessionFile(options.sessionId, filePath);
   }
 
   async function handleSend() {
@@ -2198,6 +2354,7 @@ export default function App() {
           model: nextModel,
           messages: buildLocalProviderMessages(prompt)
         });
+        const cleanedAssistantContent = stripEditorMarkers(localResult.content);
 
         const commitResponse = await fetch(`${serverUrl.replace(/\/$/, "")}/agent/reply/commit`, {
           method: "POST",
@@ -2208,7 +2365,8 @@ export default function App() {
             model: localResult.model,
             sessionId: selectedSession.serverSessionId,
             message: prompt,
-            assistantContent: localResult.content
+            assistantContent: cleanedAssistantContent,
+            toolCalls: localResult.toolCalls
           })
         });
 
@@ -2222,6 +2380,12 @@ export default function App() {
         const committed = (await commitResponse.json()) as AgentReplyResponse;
         removeOptimisticMessage(selectedSession.id, optimisticId);
         applyReplyToSession(selectedSession.id, prompt, committed);
+        await maybeOpenEditorFile({
+          content: localResult.content,
+          toolCalls: localResult.toolCalls,
+          sessionId: selectedSession.serverSessionId,
+          worktreeRoot: selectedSession.worktree?.path ?? null
+        });
         return;
       }
 
@@ -2233,7 +2397,8 @@ export default function App() {
           provider: activeProvider.name,
           model: nextModel,
           sessionId: selectedSession.serverSessionId,
-          message: prompt
+          message: prompt,
+          systemPrompt: EDITOR_ASSISTANT_SYSTEM_PROMPT
         })
       });
 
@@ -2245,8 +2410,15 @@ export default function App() {
       }
 
       const result = (await response.json()) as AgentReplyResponse;
+      const rawAssistantContent = result.message.content;
+      result.message.content = stripEditorMarkers(rawAssistantContent);
       removeOptimisticMessage(selectedSession.id, optimisticId);
       applyReplyToSession(selectedSession.id, prompt, result);
+      await maybeOpenEditorFile({
+        content: rawAssistantContent,
+        sessionId: selectedSession.serverSessionId,
+        worktreeRoot: selectedSession.worktree?.path ?? null
+      });
     } catch (error) {
       removeOptimisticMessage(selectedSession.id, optimisticId);
       setDraft(prompt);

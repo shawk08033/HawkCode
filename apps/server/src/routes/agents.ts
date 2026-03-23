@@ -10,6 +10,7 @@ import {
   agentReplyRequestSchema,
   agentReplyResponseSchema,
   type AgentChatMessage,
+  type AgentToolCall,
   type AgentProviderInfo
 } from "@hawkcode/shared";
 import { prisma } from "../lib/prisma.js";
@@ -163,6 +164,7 @@ async function getConversationMessages(sessionId: string, systemPrompt?: string)
 
 async function createToolCall(options: {
   agentRunId: string;
+  name?: string;
   input: string;
   output?: string;
   durationMs?: number;
@@ -170,7 +172,7 @@ async function createToolCall(options: {
   await prisma.toolCall.create({
     data: {
       agentRunId: options.agentRunId,
-      name: "generate_reply",
+      name: options.name ?? "generate_reply",
       input: options.input,
       output: options.output,
       durationMs: options.durationMs
@@ -184,6 +186,7 @@ async function persistAgentReply(options: {
   sessionId?: string;
   message: string;
   assistantContent: string;
+  toolCalls?: AgentToolCall[];
   systemPrompt?: string;
   userId: string;
   memberships: Array<{ workspaceId: string }>;
@@ -279,6 +282,21 @@ async function persistAgentReply(options: {
     output: options.assistantContent
   });
 
+  for (const toolCall of options.toolCalls ?? []) {
+    await createToolCall({
+      agentRunId: agentRun.id,
+      name: toolCall.name,
+      input:
+        toolCall.input ??
+        JSON.stringify({
+          provider: options.provider,
+          model: options.model
+        }),
+      output: toolCall.output,
+      durationMs: toolCall.durationMs
+    });
+  }
+
   return agentReplyResponseSchema.parse({
     sessionId: session.id,
     agentRunId: agentRun.id,
@@ -361,6 +379,7 @@ export async function registerAgentRoutes(server: FastifyInstance) {
         sessionId: session.id,
         message: parsed.data.message,
         assistantContent: result.content,
+        toolCalls: result.toolCalls,
         systemPrompt: parsed.data.systemPrompt,
         userId: user.id,
         memberships: user.memberships
@@ -411,6 +430,7 @@ export async function registerAgentRoutes(server: FastifyInstance) {
         sessionId: parsed.data.sessionId,
         message: parsed.data.message,
         assistantContent: parsed.data.assistantContent,
+        toolCalls: parsed.data.toolCalls,
         systemPrompt: parsed.data.systemPrompt,
         userId: user.id,
         memberships: user.memberships

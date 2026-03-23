@@ -2,9 +2,8 @@ import { app, BrowserWindow, ipcMain, net, session, shell } from "electron";
 import path from "node:path";
 import fs from "node:fs";
 import { execFile, execFileSync, spawn } from "node:child_process";
-import { promises as fsp } from "node:fs";
 import { createRequire } from "node:module";
-import { homedir, tmpdir, userInfo } from "node:os";
+import { homedir, userInfo } from "node:os";
 import { promisify } from "node:util";
 
 const require = createRequire(import.meta.url);
@@ -32,6 +31,15 @@ type PendingCert = {
   validStart?: number;
   validExpiry?: number;
 };
+
+type AgentToolCall = {
+  name: string;
+  input?: string;
+  output?: string;
+  durationMs?: number;
+};
+
+type JsonRecord = Record<string, unknown>;
 
 const store = new Store<StoreShape>({
   defaults: {
@@ -281,7 +289,6 @@ function buildCliPrompt(providerLabel: string, messages: Array<{ role: string; c
     `You are the ${providerLabel} agent inside HawkCode.`,
     "Respond to the latest user request using the conversation below as context.",
     "Return only the assistant reply text.",
-    "Do not modify files, run shell commands, or make tool calls.",
     "",
     ...messages.map((message) => `${message.role.toUpperCase()}: ${message.content}`)
   ].join("\n");
@@ -309,7 +316,6 @@ function buildCursorPrompt(messages: Array<{ role: string; content: string }>) {
     "You are the Cursor agent inside HawkCode.",
     "Answer the latest user request.",
     "Return only the assistant reply text.",
-    "Do not modify files, run shell commands, or make tool calls.",
     "",
     "Recent conversation context:",
     ...contextMessages.map((message) => `${message.role}: ${summarizeForCursor(message.content)}`),
@@ -328,7 +334,6 @@ function buildGeminiPrompt(messages: Array<{ role: string; content: string }>) {
     "You are the Gemini agent inside HawkCode.",
     "Answer the latest user request.",
     "Return only the assistant reply text.",
-    "Do not modify files, run shell commands, or make tool calls.",
     "",
     "Recent conversation context:",
     ...contextMessages.map((message) => `${message.role}: ${summarizeForCursor(message.content)}`),
@@ -359,6 +364,163 @@ function extractJsonObject(value: string) {
       return null;
     }
   }
+}
+
+function stringifyJson(value: unknown) {
+  if (value === undefined) {
+    return undefined;
+  }
+
+  if (typeof value === "string") {
+    const trimmed = value.trim();
+    return trimmed.length > 0 ? trimmed : undefined;
+  }
+
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return undefined;
+  }
+}
+
+function parseJsonLines(value: string) {
+  return value
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line.length > 0)
+    .flatMap((line) => {
+      try {
+        return [JSON.parse(line) as JsonRecord];
+      } catch {
+        return [];
+      }
+    });
+}
+
+function isToolLikeEventType(value: unknown) {
+  return typeof value === "string" && /(tool|mcp|call)/i.test(value);
+}
+
+function normalizeToolCall(name: string, input?: unknown, output?: unknown, durationMs?: unknown) {
+  const normalizedName = name.trim();
+  if (!normalizedName) {
+    return null;
+  }
+
+  const normalizedDuration =
+    typeof durationMs === "number" && Number.isFinite(durationMs) && durationMs >= 0
+      ? Math.round(durationMs)
+      : undefined;
+
+  return {
+    name: normalizedName,
+    input: stringifyJson(input),
+    output: stringifyJson(output),
+    durationMs: normalizedDuration
+  } satisfies AgentToolCall;
+}
+
+function extractCodexToolCalls(events: JsonRecord[]) {
+  const toolCalls: AgentToolCall[] = [];
+
+  for (const event of events) {
+    if (event.type !== "item.completed") {
+      continue;
+    }
+
+    const item = event.item;
+    if (!item || typeof item !== "object" || Array.isArray(item)) {
+      continue;
+    }
+
+    const itemRecord = item as JsonRecord;
+    const itemType = itemRecord.type;
+    if (itemType === "agent_message") {
+      continue;
+    }
+
+    if (!isToolLikeEventType(itemType) && typeof itemRecord.name !== "string") {
+      continue;
+    }
+
+    const normalized = normalizeToolCall(
+      typeof itemRecord.name === "string" ? itemRecord.name : String(itemType ?? "tool_call"),
+      itemRecord.input ?? itemRecord.arguments ?? itemRecord.payload,
+      itemRecord.output ?? itemRecord.result ?? itemRecord.content,
+      itemRecord.duration_ms ?? itemRecord.durationMs
+    );
+    if (normalized) {
+      toolCalls.push(normalized);
+    }
+  }
+
+  return toolCalls;
+}
+
+function extractCursorToolCalls(events: JsonRecord[]) {
+  const toolCalls: AgentToolCall[] = [];
+
+  for (const event of events) {
+    if (event.type === "result") {
+      continue;
+    }
+
+    const eventName =
+      typeof event.tool_name === "string"
+        ? event.tool_name
+        : typeof event.name === "string" && isToolLikeEventType(event.type)
+          ? event.name
+          : undefined;
+
+    if (!eventName && !isToolLikeEventType(event.type)) {
+      continue;
+    }
+
+    const normalized = normalizeToolCall(
+      eventName ?? String(event.type ?? "tool_call"),
+      event.input ?? event.arguments ?? event.params ?? event.request,
+      event.output ?? event.result ?? event.response,
+      event.duration_ms ?? event.durationMs
+    );
+    if (normalized) {
+      toolCalls.push(normalized);
+    }
+  }
+
+  return toolCalls;
+}
+
+function extractGeminiToolCalls(events: JsonRecord[]) {
+  const toolCalls: AgentToolCall[] = [];
+
+  for (const event of events) {
+    if (event.type === "content" || event.type === "message") {
+      continue;
+    }
+
+    const eventName =
+      typeof event.tool_name === "string"
+        ? event.tool_name
+        : typeof event.name === "string" && isToolLikeEventType(event.type)
+          ? event.name
+          : undefined;
+
+    if (!eventName && !isToolLikeEventType(event.type)) {
+      continue;
+    }
+
+    const normalized = normalizeToolCall(
+      eventName ?? String(event.type ?? "tool_call"),
+      event.input ?? event.arguments ?? event.request,
+      event.output ?? event.result ?? event.response,
+      event.duration_ms ?? event.durationMs
+    );
+    if (normalized) {
+      toolCalls.push(normalized);
+    }
+  }
+
+  return toolCalls;
 }
 
 async function getCodexAuthStatus() {
@@ -499,20 +661,15 @@ async function getGeminiCliStatus() {
 }
 
 async function generateCodexReply(messages: Array<{ role: string; content: string }>, model = "gpt-5") {
-  const outputFile = path.join(
-    await fsp.mkdtemp(path.join(tmpdir(), "hawkcode-desktop-codex-")),
-    "last-message.txt"
-  );
   const prompt = buildCliPrompt("Codex", messages);
+  let stdout = "";
 
   try {
-    await execFileAsync(codexCommand, [
+    const result = await execFileAsync(codexCommand, [
       "exec",
       "--skip-git-repo-check",
-      "--sandbox",
-      "read-only",
-      "--output-last-message",
-      outputFile,
+      "--full-auto",
+      "--json",
       "-m",
       model,
       prompt
@@ -520,12 +677,27 @@ async function generateCodexReply(messages: Array<{ role: string; content: strin
       cwd: process.cwd(),
       env: process.env
     });
+    stdout = result.stdout;
   } catch (error) {
     const message = error instanceof Error ? error.message : "Codex CLI request failed.";
     throw new Error(`Codex CLI request failed: ${message}`);
   }
 
-  const content = (await fsp.readFile(outputFile, "utf8")).trim();
+  const events = parseJsonLines(stdout);
+  const content = events
+    .flatMap((event) => {
+      const item = event.item;
+      if (!item || typeof item !== "object" || Array.isArray(item)) {
+        return [];
+      }
+
+      const itemRecord = item as JsonRecord;
+      return itemRecord.type === "agent_message" && typeof itemRecord.text === "string"
+        ? [itemRecord.text.trim()]
+        : [];
+    })
+    .filter((value) => value.length > 0)
+    .at(-1) ?? "";
   if (!content) {
     throw new Error("Codex returned an empty response.");
   }
@@ -533,7 +705,8 @@ async function generateCodexReply(messages: Array<{ role: string; content: strin
   return {
     provider: "codex" as const,
     model,
-    content
+    content,
+    toolCalls: extractCodexToolCalls(events)
   };
 }
 
@@ -552,9 +725,9 @@ async function generateGeminiReply(
   const prompt = buildGeminiPrompt(messages);
   const args = [
     "--output-format",
-    "json",
+    "stream-json",
     "--approval-mode",
-    "plan"
+    "yolo"
   ];
   const resumeSessionId = getGeminiResumeSessionId(sessionId);
   if (resumeSessionId) {
@@ -579,9 +752,9 @@ async function generateGeminiReply(
       clearGeminiResumeSessionId(sessionId);
       const retryArgs = [
         "--output-format",
-        "json",
+        "stream-json",
         "--approval-mode",
-        "plan",
+        "yolo",
         "-p",
         prompt,
         ...(model && model.trim().length > 0 && model !== "auto" ? ["-m", model] : [])
@@ -603,26 +776,31 @@ async function generateGeminiReply(
     }
   }
 
-  let payload: { response?: string; session_id?: string };
-  const parsed = extractJsonObject(stdout) ?? extractJsonObject(stderr) ?? extractJsonObject(`${stdout}\n${stderr}`);
-  if (!parsed || typeof parsed !== "object") {
+  const events = parseJsonLines(stdout);
+  const payload =
+    [...events].reverse().find((event) => typeof event.response === "string" || typeof event.session_id === "string") ??
+    extractJsonObject(stdout) ??
+    extractJsonObject(stderr) ??
+    extractJsonObject(`${stdout}\n${stderr}`);
+  if (!payload || typeof payload !== "object") {
     throw new Error("Gemini CLI returned invalid JSON.");
   }
-  payload = parsed as { response?: string; session_id?: string };
+  const parsedPayload = payload as { response?: string; session_id?: string };
 
-  const content = payload.response?.trim() ?? "";
+  const content = parsedPayload.response?.trim() ?? "";
   if (!content) {
     throw new Error("Gemini CLI returned an empty response.");
   }
 
-  if (sessionId && !resumeSessionId && payload.session_id?.trim()) {
-    setGeminiResumeSessionId(sessionId, payload.session_id.trim());
+  if (sessionId && !resumeSessionId && parsedPayload.session_id?.trim()) {
+    setGeminiResumeSessionId(sessionId, parsedPayload.session_id.trim());
   }
 
   return {
     provider: "gemini" as const,
     model,
-    content
+    content,
+    toolCalls: extractGeminiToolCalls(events)
   };
 }
 
@@ -804,12 +982,11 @@ async function generateCursorReply(
   const prompt = buildCursorPrompt(messages);
   const chatId = await ensureCursorChatId(sessionId);
   const args = [
-    "-p",
+    "--print",
     "--output-format",
-    "json",
+    "stream-json",
     "--trust",
-    "--mode",
-    "ask"
+    "--approve-mcps"
   ];
   if (chatId) {
     args.push("--resume", chatId);
@@ -831,12 +1008,11 @@ async function generateCursorReply(
       clearCursorChatId(sessionId);
       const retryChatId = await ensureCursorChatId(sessionId);
       const retryArgs = [
-        "-p",
+        "--print",
         "--output-format",
-        "json",
+        "stream-json",
         "--trust",
-        "--mode",
-        "ask",
+        "--approve-mcps",
         ...(retryChatId ? ["--resume", retryChatId] : []),
         ...(model && model.trim().length > 0 && model !== "auto" ? ["-m", model] : []),
         prompt
@@ -857,10 +1033,11 @@ async function generateCursorReply(
     }
   }
 
-  let payload: { type?: string; subtype?: string; is_error?: boolean; result?: string };
-  try {
-    payload = JSON.parse(stdout) as { type?: string; subtype?: string; is_error?: boolean; result?: string };
-  } catch {
+  const events = parseJsonLines(stdout);
+  const payload = [...events].reverse().find((event) => event.type === "result") as
+    | { type?: string; subtype?: string; is_error?: boolean; result?: string }
+    | undefined;
+  if (!payload) {
     throw new Error("Cursor CLI returned invalid JSON.");
   }
 
@@ -875,7 +1052,8 @@ async function generateCursorReply(
   return {
     provider: "cursor" as const,
     model,
-    content
+    content,
+    toolCalls: extractCursorToolCalls(events)
   };
 }
 
