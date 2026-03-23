@@ -12,6 +12,19 @@ type User = {
   email: string;
 };
 
+type MembershipRecord = {
+  role: "owner" | "maintainer" | "viewer";
+  workspaceId: string;
+  workspaceName: string;
+};
+
+type WorkspaceSummary = {
+  id: string;
+  name: string;
+  role: MembershipRecord["role"];
+  createdAt: string;
+};
+
 type ProviderInfo = {
   name: "codex" | "cursor" | "openrouter";
   label: string;
@@ -25,10 +38,25 @@ type ChatMessage = {
   timestamp: string;
 };
 
+type SessionCheckoutState =
+  | {
+      checkedOutById: string;
+      checkedOutByCurrentUser: boolean;
+      checkedOutByEmail?: string | null;
+      expiresAt: string;
+    }
+  | null;
+
 type SessionRecord = {
   id: string;
   serverSessionId?: string;
   title: string;
+  ownerId: string;
+  sharedWithWorkspace: boolean;
+  canManage: boolean;
+  canDelete: boolean;
+  canPrompt: boolean;
+  checkout: SessionCheckoutState;
   projectId?: string | null;
   projectName?: string | null;
   updated: string;
@@ -104,6 +132,17 @@ type AgentReplyResponse = {
 type WorkspaceTreeResponse = {
   workspaces?: WorkspaceRecord[];
 };
+
+type WorkspacesResponse = {
+  workspaces?: WorkspaceSummary[];
+};
+
+type AuthMeResponse = {
+  user?: User;
+  memberships?: MembershipRecord[];
+};
+
+const SESSION_CHECKOUT_HEARTBEAT_MS = 5 * 60 * 1000;
 
 type WorkspaceGithubResponse = {
   github?: WorkspaceGithubState;
@@ -204,6 +243,7 @@ type GitHubAuthState = {
 };
 
 const DEFAULT_URL = "http://localhost:3001";
+const SESSION_CHECKOUT_TICK_MS = 30 * 1000;
 
 function formatTimestamp(value?: string) {
   if (!value) {
@@ -221,6 +261,31 @@ function formatTimestamp(value?: string) {
   });
 }
 
+function formatCheckoutExpiry(expiresAt?: string, nowMs = Date.now()) {
+  if (!expiresAt) {
+    return null;
+  }
+
+  const expiryMs = new Date(expiresAt).getTime();
+  if (Number.isNaN(expiryMs)) {
+    return null;
+  }
+
+  const remainingMs = expiryMs - nowMs;
+  if (remainingMs <= 0) {
+    return "expires now";
+  }
+
+  const remainingMinutes = Math.ceil(remainingMs / 60000);
+  if (remainingMinutes < 60) {
+    return `expires in ${remainingMinutes}m`;
+  }
+
+  const hours = Math.floor(remainingMinutes / 60);
+  const minutes = remainingMinutes % 60;
+  return minutes > 0 ? `expires in ${hours}h ${minutes}m` : `expires in ${hours}h`;
+}
+
 function preferProvider(providers: ProviderInfo[]) {
   return providers.find((provider) => provider.name === "codex") ?? providers[0] ?? null;
 }
@@ -236,6 +301,14 @@ function buildModelSwitchNote(nextRunLabel: string) {
 function getModelSwitchNote(session: SessionRecord, provider: ProviderInfo, model: string) {
   const nextRunLabel = formatProviderRunLabel(provider, model);
   return session.model === nextRunLabel ? null : buildModelSwitchNote(nextRunLabel);
+}
+
+function mergeWorkspaceTree(workspaces: WorkspaceSummary[], tree: WorkspaceRecord[]) {
+  const treeMap = new Map(tree.map((workspace) => [workspace.id, workspace]));
+  return workspaces.map((workspace) => {
+    const existing = treeMap.get(workspace.id);
+    return existing ?? { id: workspace.id, name: workspace.name, sessions: [], schedules: [] };
+  });
 }
 
 export default function AppHome() {
@@ -257,6 +330,12 @@ export default function AppHome() {
   const [isLoadingGit, setIsLoadingGit] = useState(false);
   const [isLoadingFiles, setIsLoadingFiles] = useState(false);
   const [isCreatingWorktree, setIsCreatingWorktree] = useState(false);
+  const [isUpdatingSessionSharing, setIsUpdatingSessionSharing] = useState(false);
+  const [isEditingSessionTitle, setIsEditingSessionTitle] = useState(false);
+  const [sessionTitleDraft, setSessionTitleDraft] = useState("");
+  const [isRenamingSession, setIsRenamingSession] = useState(false);
+  const [isCheckingOutSession, setIsCheckingOutSession] = useState(false);
+  const [isDeletingSession, setIsDeletingSession] = useState(false);
   const [githubError, setGithubError] = useState<string | null>(null);
   const [gitError, setGitError] = useState<string | null>(null);
   const [fileError, setFileError] = useState<string | null>(null);
@@ -264,6 +343,7 @@ export default function AppHome() {
     inProgress: false
   });
   const [sessionFiles, setSessionFiles] = useState<SessionFileContext | null>(null);
+  const [checkoutNowMs, setCheckoutNowMs] = useState(() => Date.now());
 
   const allSessions = useMemo(
     () => workspaceTree.flatMap((workspace) => workspace.sessions),
@@ -289,6 +369,24 @@ export default function AppHome() {
     },
     [selectedSessionId, selectedWorkspaceId, workspaceTree]
   );
+
+  function replaceSessionRecord(localSessionId: string, updatedSession: SessionRecord) {
+    setWorkspaceTree((current) =>
+      current.map((workspace) => ({
+        ...workspace,
+        sessions: workspace.sessions.map((session) =>
+          session.id === localSessionId
+            ? {
+                ...session,
+                ...updatedSession,
+                serverSessionId: updatedSession.id
+              }
+            : session
+        )
+      }))
+    );
+  }
+
   const syncedRepos = useMemo(
     () => workspaceGit?.repos.filter((repo) => repo.serverSync.status === "ready") ?? [],
     [workspaceGit]
@@ -510,6 +608,25 @@ export default function AppHome() {
   }, [selectedSessionId]);
 
   useEffect(() => {
+    setIsEditingSessionTitle(false);
+    setSessionTitleDraft(selectedSession?.title ?? "");
+  }, [selectedSession?.id, selectedSession?.title]);
+
+  useEffect(() => {
+    if (!selectedSession?.checkout) {
+      return;
+    }
+
+    const interval = window.setInterval(() => {
+      setCheckoutNowMs(Date.now());
+    }, SESSION_CHECKOUT_TICK_MS);
+
+    return () => {
+      window.clearInterval(interval);
+    };
+  }, [selectedSession?.checkout?.expiresAt]);
+
+  useEffect(() => {
     if (!selectedSession?.serverSessionId) {
       setSessionFiles(null);
       setFileError(null);
@@ -526,6 +643,58 @@ export default function AppHome() {
   }, [selectedSession?.serverSessionId, selectedSession?.worktree?.path]);
 
   useEffect(() => {
+    if (
+      !serverUrl ||
+      !selectedSession?.serverSessionId ||
+      !selectedSession.checkout?.checkedOutByCurrentUser
+    ) {
+      return;
+    }
+
+    const localSessionId = selectedSession.id;
+    const serverSessionId = selectedSession.serverSessionId;
+    let cancelled = false;
+
+    async function renewCheckout() {
+      try {
+        const response = await fetch(
+          `${serverUrl.replace(/\/$/, "")}/sessions/${serverSessionId}/checkout`,
+          {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            credentials: "include",
+            body: JSON.stringify({})
+          }
+        );
+
+        const data = (await response.json().catch(() => null)) as
+          | { session?: SessionRecord }
+          | null;
+        if (!cancelled && response.ok && data?.session) {
+          replaceSessionRecord(localSessionId, data.session);
+        }
+      } catch {
+        return;
+      }
+    }
+
+    void renewCheckout();
+    const interval = window.setInterval(() => {
+      void renewCheckout();
+    }, SESSION_CHECKOUT_HEARTBEAT_MS);
+
+    return () => {
+      cancelled = true;
+      window.clearInterval(interval);
+    };
+  }, [
+    selectedSession?.checkout?.checkedOutByCurrentUser,
+    selectedSession?.id,
+    selectedSession?.serverSessionId,
+    serverUrl
+  ]);
+
+  useEffect(() => {
     if (!serverUrl) return;
     async function fetchMe() {
       try {
@@ -537,23 +706,15 @@ export default function AppHome() {
           window.location.href = "/login";
           return;
         }
-        const data = await response.json();
-        setUser(data.user);
-        await checkAdmin();
+        const data = (await response.json()) as AuthMeResponse;
+        setUser(data.user ?? null);
+        setIsAdmin(
+          (data.memberships ?? []).some(
+            (membership) => membership.role === "owner" || membership.role === "maintainer"
+          )
+        );
       } catch {
         window.location.href = "/login";
-      }
-    }
-
-    async function checkAdmin() {
-      try {
-        const response = await fetch(`${serverUrl.replace(/\/$/, "")}/invites`, {
-          method: "GET",
-          credentials: "include"
-        });
-        setIsAdmin(response.ok);
-      } catch {
-        setIsAdmin(false);
       }
     }
 
@@ -604,23 +765,32 @@ export default function AppHome() {
     async function loadWorkspaceTree() {
       setWorkspaceTree([]);
       try {
-        const response = await fetch(`${serverUrl.replace(/\/$/, "")}/workspaces/tree`, {
-          method: "GET",
-          credentials: "include"
-        });
-        if (!response.ok) {
+        const [workspacesResponse, treeResponse] = await Promise.all([
+          fetch(`${serverUrl.replace(/\/$/, "")}/workspaces`, {
+            method: "GET",
+            credentials: "include"
+          }),
+          fetch(`${serverUrl.replace(/\/$/, "")}/workspaces/tree`, {
+            method: "GET",
+            credentials: "include"
+          })
+        ]);
+        if (!workspacesResponse.ok || !treeResponse.ok) {
           return;
         }
 
-        const data = (await response.json()) as WorkspaceTreeResponse;
-        const nextTree =
-          data.workspaces?.map((workspace) => ({
+        const workspaceData = (await workspacesResponse.json()) as WorkspacesResponse;
+        const treeData = (await treeResponse.json()) as WorkspaceTreeResponse;
+        const nextTree = mergeWorkspaceTree(
+          workspaceData.workspaces ?? [],
+          (treeData.workspaces ?? []).map((workspace) => ({
             ...workspace,
             sessions: workspace.sessions.map((session) => ({
               ...session,
               serverSessionId: session.id
             }))
-          })) ?? [];
+          }))
+        );
 
         setWorkspaceTree(nextTree);
       } catch {
@@ -718,6 +888,190 @@ export default function AppHome() {
       setSelectedSessionId(nextSession.id);
     } catch (error) {
       setSendError(error instanceof Error ? error.message : "Could not create session.");
+    }
+  }
+
+  async function handleToggleSessionSharing() {
+    if (!selectedSession?.serverSessionId || !selectedSession.canManage) {
+      return;
+    }
+
+    setIsUpdatingSessionSharing(true);
+    setSendError(null);
+
+    try {
+      const response = await fetch(
+        `${serverUrl.replace(/\/$/, "")}/sessions/${selectedSession.serverSessionId}/sharing`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({
+            sharedWithWorkspace: !selectedSession.sharedWithWorkspace
+          })
+        }
+      );
+
+      const data = (await response.json().catch(() => null)) as
+        | { session?: SessionRecord; message?: string; error?: string }
+        | null;
+      if (!response.ok || !data?.session) {
+        throw new Error(data?.message ?? data?.error ?? "Could not update session sharing.");
+      }
+      const updatedSession = data.session;
+
+      replaceSessionRecord(selectedSession.id, updatedSession);
+    } catch (error) {
+      setSendError(error instanceof Error ? error.message : "Could not update session sharing.");
+    } finally {
+      setIsUpdatingSessionSharing(false);
+    }
+  }
+
+  async function handleRenameSession() {
+    if (!selectedSession?.serverSessionId || !selectedSession.canManage) {
+      return;
+    }
+
+    const title = sessionTitleDraft.trim();
+    if (!title) {
+      setSendError("Session name is required.");
+      return;
+    }
+
+    setIsRenamingSession(true);
+    setSendError(null);
+
+    try {
+      const response = await fetch(
+        `${serverUrl.replace(/\/$/, "")}/sessions/${selectedSession.serverSessionId}`,
+        {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          body: JSON.stringify({ title })
+        }
+      );
+
+      const data = (await response.json().catch(() => null)) as
+        | { session?: SessionRecord; message?: string; error?: string }
+        | null;
+      if (!response.ok || !data?.session) {
+        throw new Error(data?.message ?? data?.error ?? "Could not rename session.");
+      }
+
+      const updatedSession = data.session;
+      setWorkspaceTree((current) =>
+        current.map((workspace) => ({
+          ...workspace,
+          sessions: workspace.sessions.map((session) =>
+            session.id === selectedSession.id
+              ? {
+                  ...session,
+                  ...updatedSession,
+                  serverSessionId: updatedSession.id
+                }
+              : session
+          )
+        }))
+      );
+      setIsEditingSessionTitle(false);
+    } catch (error) {
+      setSendError(error instanceof Error ? error.message : "Could not rename session.");
+    } finally {
+      setIsRenamingSession(false);
+    }
+  }
+
+  async function handleDeleteSession() {
+    if (!selectedSession?.serverSessionId || !selectedSession.canManage || !selectedSession.canDelete) {
+      return;
+    }
+
+    const confirmed = window.confirm(`Delete "${selectedSession.title}"?`);
+    if (!confirmed) {
+      return;
+    }
+
+    setIsDeletingSession(true);
+    setSendError(null);
+
+    try {
+      const response = await fetch(
+        `${serverUrl.replace(/\/$/, "")}/sessions/${selectedSession.serverSessionId}`,
+        {
+          method: "DELETE",
+          credentials: "include"
+        }
+      );
+
+      if (!response.ok) {
+        const data = (await response.json().catch(() => null)) as
+          | { message?: string; error?: string }
+          | null;
+        throw new Error(data?.message ?? data?.error ?? "Could not delete session.");
+      }
+
+      setWorkspaceTree((current) =>
+        current.map((workspace) => ({
+          ...workspace,
+          sessions: workspace.sessions.filter((session) => session.id !== selectedSession.id)
+        }))
+      );
+      setSessionFiles(null);
+    } catch (error) {
+      setSendError(error instanceof Error ? error.message : "Could not delete session.");
+    } finally {
+      setIsDeletingSession(false);
+    }
+  }
+
+  async function handleToggleSessionCheckout() {
+    if (!selectedSession?.serverSessionId) {
+      return;
+    }
+
+    setIsCheckingOutSession(true);
+    setSendError(null);
+
+    try {
+      const isCurrentHolder = selectedSession.checkout?.checkedOutByCurrentUser;
+      const response = await fetch(
+        `${serverUrl.replace(/\/$/, "")}/sessions/${selectedSession.serverSessionId}/checkout`,
+        {
+          method: isCurrentHolder ? "DELETE" : "POST",
+          headers: { "Content-Type": "application/json" },
+          credentials: "include",
+          ...(isCurrentHolder ? {} : { body: JSON.stringify({}) })
+        }
+      );
+
+      const data = (await response.json().catch(() => null)) as
+        | { session?: SessionRecord; message?: string; error?: string }
+        | null;
+      if (!response.ok || !data?.session) {
+        throw new Error(data?.message ?? data?.error ?? "Could not update session checkout.");
+      }
+
+      const updatedSession = data.session;
+      setWorkspaceTree((current) =>
+        current.map((workspace) => ({
+          ...workspace,
+          sessions: workspace.sessions.map((session) =>
+            session.id === selectedSession.id
+              ? {
+                  ...session,
+                  ...updatedSession,
+                  serverSessionId: updatedSession.id
+                }
+              : session
+          )
+        }))
+      );
+    } catch (error) {
+      setSendError(error instanceof Error ? error.message : "Could not update session checkout.");
+    } finally {
+      setIsCheckingOutSession(false);
     }
   }
 
@@ -1198,9 +1552,14 @@ export default function AppHome() {
                         >
                           <div className="flex items-center justify-between gap-2">
                             <span className="text-xs font-medium">{session.title}</span>
-                            <span className="text-[10px] uppercase tracking-[0.16em] text-muted-foreground">
-                              {session.status}
-                            </span>
+                            <div className="flex items-center gap-2">
+                              <span className="text-[10px] uppercase tracking-[0.16em] text-muted-foreground">
+                                {session.sharedWithWorkspace ? "Shared" : "Private"}
+                              </span>
+                              <span className="text-[10px] uppercase tracking-[0.16em] text-muted-foreground">
+                                {session.status}
+                              </span>
+                            </div>
                           </div>
                           <div className="mt-1 text-[11px] text-muted-foreground">
                             {session.updated} • {session.model}
@@ -1252,9 +1611,34 @@ export default function AppHome() {
                   ) : null}
                 </div>
                 <div>
-                  <h1 className="text-2xl font-semibold">
-                    {selectedSession?.title ?? "Select a session"}
-                  </h1>
+                  {selectedSession && isEditingSessionTitle && selectedSession.canManage ? (
+                    <div className="flex items-center gap-2">
+                      <input
+                        value={sessionTitleDraft}
+                        onChange={(event) => setSessionTitleDraft(event.target.value)}
+                        className="w-full rounded-lg border border-border bg-background px-3 py-2 text-2xl font-semibold outline-none transition focus:border-foreground/30"
+                        maxLength={120}
+                      />
+                      <Button size="sm" variant="outline" onClick={handleRenameSession} disabled={isRenamingSession}>
+                        {isRenamingSession ? "Saving..." : "Save"}
+                      </Button>
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => {
+                          setIsEditingSessionTitle(false);
+                          setSessionTitleDraft(selectedSession.title);
+                        }}
+                        disabled={isRenamingSession}
+                      >
+                        Cancel
+                      </Button>
+                    </div>
+                  ) : (
+                    <h1 className="text-2xl font-semibold">
+                      {selectedSession?.title ?? "Select a session"}
+                    </h1>
+                  )}
                   <p className="mt-1 text-sm text-muted-foreground">
                     {selectedSession
                       ? `Server-backed AI chat for ${selectedSession.model} on ${selectedSession.branch}.`
@@ -1263,6 +1647,68 @@ export default function AppHome() {
                 </div>
               </div>
               <div className="flex items-center gap-2">
+                {selectedSession ? (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={handleToggleSessionCheckout}
+                    disabled={isCheckingOutSession || Boolean(selectedSession.checkout && !selectedSession.checkout.checkedOutByCurrentUser)}
+                    title={
+                      selectedSession.checkout && !selectedSession.checkout.checkedOutByCurrentUser
+                        ? `Checked out by ${selectedSession.checkout.checkedOutByEmail ?? "another user"}`
+                        : selectedSession.checkout?.checkedOutByCurrentUser
+                          ? "Release checkout"
+                          : "Check out session"
+                    }
+                  >
+                    {isCheckingOutSession
+                      ? "Saving..."
+                      : selectedSession.checkout?.checkedOutByCurrentUser
+                        ? "Release checkout"
+                        : selectedSession.checkout
+                          ? "Checked out"
+                          : "Check out"}
+                  </Button>
+                ) : null}
+                {selectedSession?.canManage ? (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={() => setIsEditingSessionTitle(true)}
+                    disabled={isEditingSessionTitle}
+                  >
+                    Rename
+                  </Button>
+                ) : null}
+                {selectedSession?.canManage ? (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={handleToggleSessionSharing}
+                    disabled={isUpdatingSessionSharing}
+                  >
+                    {isUpdatingSessionSharing
+                      ? "Saving..."
+                      : selectedSession.sharedWithWorkspace
+                        ? "Make private"
+                        : "Share workspace"}
+                  </Button>
+                ) : null}
+                {selectedSession?.canManage ? (
+                  <Button
+                    size="sm"
+                    variant="outline"
+                    onClick={handleDeleteSession}
+                    disabled={isDeletingSession || !selectedSession.canDelete}
+                    title={
+                      selectedSession.canDelete
+                        ? "Delete this session"
+                        : "Shared sessions cannot be deleted after another workspace member contributes."
+                    }
+                  >
+                    {isDeletingSession ? "Deleting..." : "Delete"}
+                  </Button>
+                ) : null}
                 {isAdmin ? (
                   <Button size="sm" variant="outline" onClick={() => (window.location.href = "/app/admin")}>
                     Admin
@@ -1289,6 +1735,16 @@ export default function AppHome() {
                 </div>
                 <div className="rounded-full border border-border px-3 py-1 text-xs text-muted-foreground">
                   Updated {selectedSession.updated}
+                </div>
+                <div className="rounded-full border border-border px-3 py-1 text-xs text-muted-foreground">
+                  {selectedSession.sharedWithWorkspace ? "Shared with workspace" : "Private to creator"}
+                </div>
+                <div className="rounded-full border border-border px-3 py-1 text-xs text-muted-foreground">
+                  {selectedSession.checkout
+                    ? selectedSession.checkout.checkedOutByCurrentUser
+                      ? `Checked out by you${formatCheckoutExpiry(selectedSession.checkout.expiresAt, checkoutNowMs) ? ` · ${formatCheckoutExpiry(selectedSession.checkout.expiresAt, checkoutNowMs)}` : ""}`
+                      : `Checked out by ${selectedSession.checkout.checkedOutByEmail ?? "another user"}${formatCheckoutExpiry(selectedSession.checkout.expiresAt, checkoutNowMs) ? ` · ${formatCheckoutExpiry(selectedSession.checkout.expiresAt, checkoutNowMs)}` : ""}`
+                    : "Not checked out"}
                 </div>
                 <div className="rounded-full border border-border px-3 py-1 text-xs text-muted-foreground">
                   {syncedRepos.length} server checkouts ready
@@ -1387,7 +1843,11 @@ export default function AppHome() {
                 <textarea
                   value={draft}
                   onChange={(event) => setDraft(event.target.value)}
-                  placeholder="Message HawkCode about this session..."
+                  placeholder={
+                    selectedSession?.canPrompt
+                      ? "Message HawkCode about this session..."
+                      : `Session checked out by ${selectedSession?.checkout?.checkedOutByEmail ?? "another user"}`
+                  }
                   className="min-h-28 w-full resize-none bg-transparent text-sm leading-6 text-foreground outline-none placeholder:text-muted-foreground"
                 />
                 <div className="mt-3 flex items-center justify-between gap-3">
@@ -1417,7 +1877,7 @@ export default function AppHome() {
                     </Button>
                     <Button
                       size="sm"
-                      disabled={!selectedSession || !draft.trim() || !activeProvider || isSending}
+                      disabled={!selectedSession || !draft.trim() || !activeProvider || isSending || !selectedSession.canPrompt}
                       onClick={handleSend}
                     >
                       {isSending ? "Sending..." : "Send"}

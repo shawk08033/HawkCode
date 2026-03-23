@@ -116,6 +116,9 @@ model Session {
   workspaceId String
   projectId   String?
   ownerId     String
+  sharedWithWorkspace Boolean @default(false)
+  checkedOutById String?
+  checkoutExpiresAt DateTime?
   createdAt   DateTime   @default(now())
   workspace   Workspace  @relation(fields: [workspaceId], references: [id])
   project     Project?   @relation(fields: [projectId], references: [id])

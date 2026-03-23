@@ -15,6 +15,19 @@ type Invite = {
 type WorkspaceRecord = {
   id: string;
   name: string;
+  role?: "owner" | "maintainer" | "viewer";
+};
+
+type MembershipRecord = {
+  role: "owner" | "maintainer" | "viewer";
+  workspaceId: string;
+  workspaceName: string;
+};
+
+type WorkspaceCreateResponse = {
+  workspace?: WorkspaceRecord;
+  error?: string;
+  message?: string;
 };
 
 type GitHubUserRecord = {
@@ -55,7 +68,15 @@ type WorkspaceGithubState = {
 };
 
 type WorkspaceTreeResponse = {
-  workspaces?: Array<{ id: string; name: string }>;
+  workspaces?: WorkspaceRecord[];
+};
+
+type AuthMeResponse = {
+  user?: {
+    id: string;
+    email: string;
+  };
+  memberships?: MembershipRecord[];
 };
 
 type WorkspaceGithubResponse = {
@@ -110,6 +131,8 @@ export default function AdminPage() {
   const [revokeTarget, setRevokeTarget] = useState<{ id: string; email?: string | null } | null>(null);
   const [workspaces, setWorkspaces] = useState<WorkspaceRecord[]>([]);
   const [selectedWorkspaceId, setSelectedWorkspaceId] = useState("");
+  const [workspaceName, setWorkspaceName] = useState("");
+  const [isCreatingWorkspace, setIsCreatingWorkspace] = useState(false);
   const [workspaceGithub, setWorkspaceGithub] = useState<WorkspaceGithubState | null>(null);
   const [githubError, setGithubError] = useState<string | null>(null);
   const [isLoadingGithub, setIsLoadingGithub] = useState(false);
@@ -156,6 +179,11 @@ export default function AdminPage() {
         });
         if (!authResponse.ok) {
           window.location.href = "/login";
+          return;
+        }
+        const authBody = (await authResponse.json()) as AuthMeResponse;
+        if (!(authBody.memberships ?? []).some((membership) => membership.role !== "viewer")) {
+          window.location.href = "/app";
           return;
         }
 
@@ -304,7 +332,7 @@ export default function AdminPage() {
 
   async function fetchWorkspaces() {
     try {
-      const response = await fetch(`${serverUrl.replace(/\/$/, "")}/workspaces/tree`, {
+      const response = await fetch(`${serverUrl.replace(/\/$/, "")}/workspaces`, {
         method: "GET",
         credentials: "include"
       });
@@ -348,6 +376,39 @@ export default function AdminPage() {
       setGithubError(error instanceof Error ? error.message : "Failed to load GitHub workspace settings.");
     } finally {
       setIsLoadingGithub(false);
+    }
+  }
+
+  async function handleCreateWorkspace() {
+    const name = workspaceName.trim();
+    if (!name) {
+      setGithubError("Workspace name is required.");
+      return;
+    }
+
+    setIsCreatingWorkspace(true);
+    setGithubError(null);
+
+    try {
+      const response = await fetch(`${serverUrl.replace(/\/$/, "")}/workspaces`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        credentials: "include",
+        body: JSON.stringify({ name })
+      });
+
+      const body = (await response.json().catch(() => null)) as WorkspaceCreateResponse | null;
+      if (!response.ok || !body?.workspace) {
+        throw new Error(body?.message ?? body?.error ?? "Failed to create workspace.");
+      }
+
+      setWorkspaces((current) => [...current, body.workspace!]);
+      setSelectedWorkspaceId(body.workspace.id);
+      setWorkspaceName("");
+    } catch (error) {
+      setGithubError(error instanceof Error ? error.message : "Failed to create workspace.");
+    } finally {
+      setIsCreatingWorkspace(false);
     }
   }
 
@@ -549,6 +610,30 @@ export default function AdminPage() {
       </header>
 
       <section className="simple-grid">
+        <div className="card-shell">
+          <h3>Workspaces</h3>
+          <p>Create a new workspace and become its owner.</p>
+          <div className="stack">
+            <TextField
+              label="Workspace name"
+              value={workspaceName}
+              onChange={setWorkspaceName}
+              placeholder="New workspace"
+            />
+            <div className="actions">
+              <Button
+                label={isCreatingWorkspace ? "Creating..." : "Create workspace"}
+                onClick={handleCreateWorkspace}
+              />
+            </div>
+            <span className="time">
+              {workspaces.length > 0
+                ? `${workspaces.length} workspace${workspaces.length === 1 ? "" : "s"} available`
+                : "No workspaces yet."}
+            </span>
+          </div>
+        </div>
+
         <div className="card-shell">
           <h3>GitHub repos</h3>
           <p>Owners can connect a GitHub repo to the selected workspace.</p>

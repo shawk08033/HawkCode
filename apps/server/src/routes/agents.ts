@@ -19,6 +19,27 @@ import { loadRuntimeConfig } from "../lib/runtime-config.js";
 import { getSessionUser } from "../lib/auth-session.js";
 
 const SESSION_NOTE_PREFIX = "[Session note]";
+const DEFAULT_SESSION_CHECKOUT_MINUTES = 15;
+
+function getCheckoutExpiry(minutes = DEFAULT_SESSION_CHECKOUT_MINUTES) {
+  return new Date(Date.now() + minutes * 60 * 1000);
+}
+
+function getActiveCheckout(session: {
+  checkedOutById?: string | null;
+  checkoutExpiresAt?: Date | null;
+}) {
+  if (!session.checkedOutById || !session.checkoutExpiresAt) {
+    return null;
+  }
+  if (session.checkoutExpiresAt <= new Date()) {
+    return null;
+  }
+  return {
+    checkedOutById: session.checkedOutById,
+    checkoutExpiresAt: session.checkoutExpiresAt
+  };
+}
 
 function normalizeOptional(value?: string | null) {
   const trimmed = value?.trim();
@@ -119,7 +140,11 @@ async function resolveSession(options: {
       where: { id: options.sessionId }
     });
 
-    if (!session || !options.workspaceIds.has(session.workspaceId)) {
+    if (
+      !session ||
+      !options.workspaceIds.has(session.workspaceId) ||
+      (session.ownerId !== options.userId && !session.sharedWithWorkspace)
+    ) {
       throw new Error("session_not_found");
     }
 
@@ -130,10 +155,42 @@ async function resolveSession(options: {
     data: {
       title: trimTitle(options.initialMessage),
       ownerId: options.userId,
-      workspaceId: options.fallbackWorkspaceId
+      workspaceId: options.fallbackWorkspaceId,
+      sharedWithWorkspace: false
     }
   });
   return created;
+}
+
+async function assertSessionPromptAllowed(sessionId: string, userId: string) {
+  const session = await prisma.session.findUnique({
+    where: {
+      id: sessionId
+    },
+    select: {
+      checkedOutById: true,
+      checkoutExpiresAt: true
+    }
+  });
+
+  if (!session) {
+    throw new Error("session_not_found");
+  }
+
+  const activeCheckout = getActiveCheckout(session);
+  if (activeCheckout && activeCheckout.checkedOutById !== userId) {
+    throw new Error("session_checked_out");
+  }
+  if (activeCheckout && activeCheckout.checkedOutById === userId) {
+    await prisma.session.update({
+      where: {
+        id: sessionId
+      },
+      data: {
+        checkoutExpiresAt: getCheckoutExpiry()
+      }
+    });
+  }
 }
 
 async function getConversationMessages(sessionId: string, systemPrompt?: string) {
@@ -377,6 +434,7 @@ export async function registerAgentRoutes(server: FastifyInstance) {
         fallbackWorkspaceId: primaryMembership.workspaceId,
         initialMessage: parsed.data.message
       });
+      await assertSessionPromptAllowed(session.id, user.id);
       const inputMessages = await getConversationMessages(session.id, parsed.data.systemPrompt);
       inputMessages.push({
         role: "user",
@@ -417,6 +475,9 @@ export async function registerAgentRoutes(server: FastifyInstance) {
       if (error instanceof Error && error.message === "session_not_found") {
         return reply.code(404).send({ error: "session_not_found" });
       }
+      if (error instanceof Error && error.message === "session_checked_out") {
+        return reply.code(409).send({ error: "session_checked_out" });
+      }
 
       request.log.error(error);
       return reply.code(502).send({
@@ -441,6 +502,9 @@ export async function registerAgentRoutes(server: FastifyInstance) {
     }
 
     try {
+      if (parsed.data.sessionId) {
+        await assertSessionPromptAllowed(parsed.data.sessionId, user.id);
+      }
       const result = await persistAgentReply({
         provider: parsed.data.provider,
         model: parsed.data.model ?? "gpt-5",
@@ -458,6 +522,9 @@ export async function registerAgentRoutes(server: FastifyInstance) {
     } catch (error) {
       if (error instanceof Error && error.message === "session_not_found") {
         return reply.code(404).send({ error: "session_not_found" });
+      }
+      if (error instanceof Error && error.message === "session_checked_out") {
+        return reply.code(409).send({ error: "session_checked_out" });
       }
       if (error instanceof Error && error.message === "no_workspace") {
         return reply.code(403).send({ error: "no_workspace" });
