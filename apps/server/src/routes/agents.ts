@@ -10,6 +10,7 @@ import {
   agentReplyRequestSchema,
   agentReplyResponseSchema,
   type AgentChatMessage,
+  type AgentCommandEvent,
   type AgentToolCall,
   type AgentProviderInfo
 } from "@hawkcode/shared";
@@ -42,6 +43,10 @@ function formatRunLabel(provider: string, model: string) {
 
 function buildSessionNote(provider: string, model: string) {
   return `${SESSION_NOTE_PREFIX} Model changed to ${formatRunLabel(provider, model)}.`;
+}
+
+function buildCommandEventNote(event: AgentCommandEvent) {
+  return `[[hawkcode_command_event]]${JSON.stringify(event)}`;
 }
 
 function parseToolCallInput(raw?: string | null) {
@@ -187,6 +192,7 @@ async function persistAgentReply(options: {
   message: string;
   assistantContent: string;
   toolCalls?: AgentToolCall[];
+  commandEvents?: AgentCommandEvent[];
   systemPrompt?: string;
   userId: string;
   memberships: Array<{ workspaceId: string }>;
@@ -255,6 +261,17 @@ async function persistAgentReply(options: {
       status: "running"
     }
   });
+
+  for (const commandEvent of options.commandEvents ?? []) {
+    await prisma.message.create({
+      data: {
+        sessionId: session.id,
+        authorId: options.userId,
+        role: "system",
+        content: buildCommandEventNote(commandEvent)
+      }
+    });
+  }
 
   const assistantMessage = await prisma.message.create({
     data: {
@@ -431,6 +448,7 @@ export async function registerAgentRoutes(server: FastifyInstance) {
         message: parsed.data.message,
         assistantContent: parsed.data.assistantContent,
         toolCalls: parsed.data.toolCalls,
+        commandEvents: parsed.data.commandEvents,
         systemPrompt: parsed.data.systemPrompt,
         userId: user.id,
         memberships: user.memberships
