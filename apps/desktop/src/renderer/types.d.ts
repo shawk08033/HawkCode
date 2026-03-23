@@ -42,6 +42,7 @@ type GeminiCliStatus = {
 
 type CodexGeneratePayload = {
   provider: "codex" | "cursor" | "gemini";
+  sessionId?: string;
   messages: Array<{ role: string; content: string }>;
   model?: string;
 };

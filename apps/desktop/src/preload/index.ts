@@ -16,6 +16,7 @@ contextBridge.exposeInMainWorld("hawkcode", {
   openExternalUrl: (url: string) => ipcRenderer.invoke("hawkcode:open-external-url", url),
   generateLocalAgentReply: (payload: {
     provider: "codex" | "cursor" | "gemini";
+    sessionId?: string;
     messages: Array<{ role: string; content: string }>;
     model?: string;
   }) => ipcRenderer.invoke("hawkcode:generate-local-agent-reply", payload)
