@@ -51,6 +51,12 @@ type CodexGenerateResult = {
   provider: "codex" | "cursor" | "gemini";
   model: string;
   content: string;
+  toolCalls?: Array<{
+    name: string;
+    input?: string;
+    output?: string;
+    durationMs?: number;
+  }>;
 };
 
 declare global {
