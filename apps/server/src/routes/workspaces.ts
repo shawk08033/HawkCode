@@ -32,6 +32,22 @@ const createSessionBodySchema = z.object({
   title: z.string().min(1).max(120).optional()
 });
 
+const createWorkspaceBodySchema = z.object({
+  name: z.string().min(1).max(120)
+});
+
+const updateSessionSharingBodySchema = z.object({
+  sharedWithWorkspace: z.boolean()
+});
+
+const updateSessionBodySchema = z.object({
+  title: z.string().min(1).max(120)
+});
+
+const sessionCheckoutBodySchema = z.object({
+  extendMinutes: z.number().int().min(1).max(120).optional()
+});
+
 const connectGithubRepoBodySchema = z.object({
   repoUrl: z.string().min(1).max(300),
   projectName: z.string().min(1).max(80).optional()
@@ -220,6 +236,37 @@ function formatRunLabel(provider?: string, model?: string) {
   return model ? `${providerLabel} · ${model}` : providerLabel;
 }
 
+const DEFAULT_SESSION_CHECKOUT_MINUTES = 15;
+
+function getCheckoutExpiry(minutes = DEFAULT_SESSION_CHECKOUT_MINUTES) {
+  return new Date(Date.now() + minutes * 60 * 1000);
+}
+
+function getActiveCheckout(session: {
+  checkedOutById?: string | null;
+  checkoutExpiresAt?: Date | null;
+}) {
+  if (!session.checkedOutById || !session.checkoutExpiresAt) {
+    return null;
+  }
+  if (session.checkoutExpiresAt <= new Date()) {
+    return null;
+  }
+  return {
+    checkedOutById: session.checkedOutById,
+    checkoutExpiresAt: session.checkoutExpiresAt
+  };
+}
+
+function hasExternalSessionContributors(session: {
+  ownerId: string;
+  messages: Array<{
+    authorId: string;
+  }>;
+}) {
+  return session.messages.some((message) => message.authorId !== session.ownerId);
+}
+
 function displayMessageContent(content: string) {
   return content.replace(/^\[Session note\]\s*/, "").trim();
 }
@@ -227,9 +274,14 @@ function displayMessageContent(content: string) {
 function buildSessionRecord(session: {
   id: string;
   title: string | null;
+  ownerId: string;
+  sharedWithWorkspace: boolean;
+  checkedOutById?: string | null;
+  checkoutExpiresAt?: Date | null;
   createdAt: Date;
   messages: Array<{
     id: string;
+    authorId: string;
     role: string;
     content: string;
     createdAt: Date;
@@ -249,7 +301,7 @@ function buildSessionRecord(session: {
       input: string;
     }>;
   }>;
-}) {
+}, currentUserId: string, checkoutHolderEmail?: string | null) {
   const lastMessage = session.messages[session.messages.length - 1];
   const lastActivity = lastMessage?.createdAt ?? session.createdAt;
   const latestRun = session.agentRuns[0];
@@ -258,10 +310,28 @@ function buildSessionRecord(session: {
   });
   const sessionWorktree = session.sessionWorktree ?? null;
   const providerInfo = parseToolCallInput(latestToolCall?.input);
+  const canManage = session.ownerId === currentUserId;
+  const externalContributors = hasExternalSessionContributors(session);
+  const activeCheckout = getActiveCheckout(session);
+  const checkedOutByCurrentUser = activeCheckout?.checkedOutById === currentUserId;
+  const canPrompt = !activeCheckout || checkedOutByCurrentUser;
 
   return {
     id: session.id,
     title: session.title ?? "New session",
+    ownerId: session.ownerId,
+    sharedWithWorkspace: session.sharedWithWorkspace,
+    canManage,
+    canDelete: canManage && (!session.sharedWithWorkspace || !externalContributors),
+    canPrompt,
+    checkout: activeCheckout
+      ? {
+          checkedOutById: activeCheckout.checkedOutById,
+          checkedOutByCurrentUser,
+          checkedOutByEmail: checkoutHolderEmail ?? null,
+          expiresAt: activeCheckout.checkoutExpiresAt.toISOString()
+        }
+      : null,
     projectId: session.project?.id ?? null,
     projectName: session.project?.name ?? null,
     updated: formatRelativeTime(lastActivity),
@@ -423,6 +493,7 @@ async function buildManagedGitRepoRecord(repo: {
 
 async function getAuthorizedSession(options: {
   sessionId: string;
+  userId: string;
   memberships: Array<{ workspaceId: string }>;
 }) {
   const session = await prisma.session.findUnique({
@@ -453,6 +524,9 @@ async function getAuthorizedSession(options: {
   if (!allowedWorkspaceIds.has(session.workspaceId)) {
     throw new Error("forbidden");
   }
+  if (session.ownerId !== options.userId && !session.sharedWithWorkspace) {
+    throw new Error("forbidden");
+  }
 
   const sessionWorktree = await prisma.worktree.findFirst({
     where: {
@@ -467,6 +541,116 @@ async function getAuthorizedSession(options: {
     ...session,
     sessionWorktree
   };
+}
+
+async function getCheckoutHolderMap(sessionIds: string[]) {
+  if (sessionIds.length === 0) {
+    return new Map<string, string | null>();
+  }
+
+  const sessions = await prisma.session.findMany({
+    where: {
+      id: {
+        in: sessionIds
+      },
+      checkedOutById: {
+        not: null
+      }
+    },
+    select: {
+      id: true,
+      checkedOutById: true,
+      checkoutExpiresAt: true
+    }
+  });
+
+  const activeHolderIds = [...new Set(
+    sessions
+      .filter((session) => getActiveCheckout(session)?.checkedOutById)
+      .map((session) => session.checkedOutById as string)
+  )];
+  const users = activeHolderIds.length
+    ? await prisma.user.findMany({
+        where: {
+          id: {
+            in: activeHolderIds
+          }
+        },
+        select: {
+          id: true,
+          email: true
+        }
+      })
+    : [];
+  const userMap = new Map(users.map((user) => [user.id, user.email]));
+  const checkoutMap = new Map<string, string | null>();
+
+  for (const session of sessions) {
+    const activeCheckout = getActiveCheckout(session);
+    if (activeCheckout) {
+      checkoutMap.set(session.id, userMap.get(activeCheckout.checkedOutById) ?? null);
+    }
+  }
+
+  return checkoutMap;
+}
+
+async function deleteSessionResources(sessionId: string) {
+  const agentRuns = await prisma.agentRun.findMany({
+    where: {
+      sessionId
+    },
+    select: {
+      id: true
+    }
+  });
+  const agentRunIds = agentRuns.map((run) => run.id);
+
+  await prisma.$transaction(async (tx) => {
+    await tx.worktree.deleteMany({
+      where: {
+        sessionId
+      }
+    });
+    await tx.sandbox.deleteMany({
+      where: {
+        sessionId
+      }
+    });
+    if (agentRunIds.length > 0) {
+      await tx.artifact.deleteMany({
+        where: {
+          agentRunId: {
+            in: agentRunIds
+          }
+        }
+      });
+      await tx.toolCall.deleteMany({
+        where: {
+          agentRunId: {
+            in: agentRunIds
+          }
+        }
+      });
+      await tx.agentRun.deleteMany({
+        where: {
+          id: {
+            in: agentRunIds
+          }
+        }
+      });
+    }
+    await tx.message.deleteMany({
+      where: {
+        sessionId
+      }
+    });
+    await tx.session.delete({
+      where: {
+        id: sessionId
+      }
+    });
+  });
 }
 
 async function getAuthorizedProject(options: {
@@ -615,6 +799,96 @@ async function buildSessionGitState(input: {
 }
 
 export async function registerWorkspaceRoutes(server: FastifyInstance) {
+  server.get("/workspaces", async (request, reply) => {
+    const user = await getSessionUser(request.cookies.hawkcode_session);
+    if (!user) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+
+    const memberships = await prisma.membership.findMany({
+      where: {
+        userId: user.id
+      },
+      orderBy: [
+        {
+          createdAt: "asc"
+        },
+        {
+          workspace: {
+            createdAt: "asc"
+          }
+        }
+      ],
+      include: {
+        workspace: {
+          select: {
+            id: true,
+            name: true,
+            createdAt: true
+          }
+        }
+      }
+    });
+
+    return reply.send({
+      workspaces: memberships.map((membership) => ({
+        id: membership.workspace.id,
+        name: membership.workspace.name,
+        role: membership.role,
+        createdAt: membership.workspace.createdAt.toISOString()
+      }))
+    });
+  });
+
+  server.post("/workspaces", async (request, reply) => {
+    const user = await getSessionUser(request.cookies.hawkcode_session);
+    if (!user) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+
+    const parsed = createWorkspaceBodySchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({
+        error: "invalid_request",
+        details: parsed.error.flatten()
+      });
+    }
+
+    try {
+      const workspace = await prisma.$transaction(async (tx) => {
+        const created = await tx.workspace.create({
+          data: {
+            name: parsed.data.name.trim()
+          }
+        });
+
+        await tx.membership.create({
+          data: {
+            userId: user.id,
+            workspaceId: created.id,
+            role: "owner"
+          }
+        });
+
+        return created;
+      });
+
+      return reply.code(201).send({
+        workspace: {
+          id: workspace.id,
+          name: workspace.name,
+          sessions: [],
+          schedules: []
+        }
+      });
+    } catch (error) {
+      request.log.error(error);
+      return reply.code(500).send({
+        error: "workspace_create_failed"
+      });
+    }
+  });
+
   server.get("/workspaces/tree", async (request, reply) => {
     const user = await getSessionUser(request.cookies.hawkcode_session);
     if (!user) {
@@ -634,6 +908,16 @@ export async function registerWorkspaceRoutes(server: FastifyInstance) {
       },
       include: {
         sessions: {
+          where: {
+            OR: [
+              {
+                ownerId: user.id
+              },
+              {
+                sharedWithWorkspace: true
+              }
+            ]
+          },
           orderBy: {
             createdAt: "desc"
           },
@@ -698,6 +982,7 @@ export async function registerWorkspaceRoutes(server: FastifyInstance) {
           }
         })
       : [];
+    const checkoutHolderMap = await getCheckoutHolderMap(sessionIds);
     const sessionWorktreeMap = new Map<string, (typeof sessionWorktrees)[number]>();
     for (const worktree of sessionWorktrees) {
       if (worktree.sessionId && !sessionWorktreeMap.has(worktree.sessionId)) {
@@ -713,7 +998,7 @@ export async function registerWorkspaceRoutes(server: FastifyInstance) {
           buildSessionRecord({
             ...session,
             sessionWorktree: sessionWorktreeMap.get(session.id) ?? null
-          })
+          }, user.id, checkoutHolderMap.get(session.id) ?? null)
         ),
         schedules: workspace.projects.flatMap((project: (typeof workspace.projects)[number]) =>
           project.schedules.map((schedule: (typeof project.schedules)[number]) => ({
@@ -1137,6 +1422,7 @@ export async function registerWorkspaceRoutes(server: FastifyInstance) {
     try {
       const session = await getAuthorizedSession({
         sessionId,
+        userId: user.id,
         memberships: user.memberships
       });
       const project = await getAuthorizedProject({
@@ -1188,7 +1474,7 @@ export async function registerWorkspaceRoutes(server: FastifyInstance) {
         session: buildSessionRecord({
           ...updated,
           sessionWorktree: session.sessionWorktree
-        })
+        }, user.id, null)
       });
     } catch (error) {
       if (error instanceof Error && error.message === "session_not_found") {
@@ -1226,6 +1512,7 @@ export async function registerWorkspaceRoutes(server: FastifyInstance) {
     try {
       const session = await getAuthorizedSession({
         sessionId,
+        userId: user.id,
         memberships: user.memberships
       });
       const project = await getAuthorizedProject({
@@ -1338,6 +1625,7 @@ export async function registerWorkspaceRoutes(server: FastifyInstance) {
     try {
       const session = await getAuthorizedSession({
         sessionId,
+        userId: user.id,
         memberships: user.memberships
       });
       const worktree = session.sessionWorktree;
@@ -1390,6 +1678,7 @@ export async function registerWorkspaceRoutes(server: FastifyInstance) {
     try {
       const session = await getAuthorizedSession({
         sessionId,
+        userId: user.id,
         memberships: user.memberships
       });
       if (!session.projectId) {
@@ -1452,6 +1741,7 @@ export async function registerWorkspaceRoutes(server: FastifyInstance) {
     try {
       const session = await getAuthorizedSession({
         sessionId,
+        userId: user.id,
         memberships: user.memberships
       });
       const worktree = session.sessionWorktree;
@@ -1514,6 +1804,7 @@ export async function registerWorkspaceRoutes(server: FastifyInstance) {
     try {
       const session = await getAuthorizedSession({
         sessionId,
+        userId: user.id,
         memberships: user.memberships
       });
       if (!session.sessionWorktree || !session.projectId) {
@@ -1567,6 +1858,7 @@ export async function registerWorkspaceRoutes(server: FastifyInstance) {
     try {
       const session = await getAuthorizedSession({
         sessionId,
+        userId: user.id,
         memberships: user.memberships
       });
       if (!session.sessionWorktree || !session.projectId) {
@@ -1626,6 +1918,7 @@ export async function registerWorkspaceRoutes(server: FastifyInstance) {
     try {
       const session = await getAuthorizedSession({
         sessionId,
+        userId: user.id,
         memberships: user.memberships
       });
       if (!session.sessionWorktree || !session.projectId) {
@@ -1701,6 +1994,7 @@ export async function registerWorkspaceRoutes(server: FastifyInstance) {
     try {
       const session = await getAuthorizedSession({
         sessionId,
+        userId: user.id,
         memberships: user.memberships
       });
       const worktree = session.sessionWorktree;
@@ -1778,6 +2072,7 @@ export async function registerWorkspaceRoutes(server: FastifyInstance) {
       data: {
         ownerId: user.id,
         workspaceId,
+        sharedWithWorkspace: false,
         title: parsed.data.title ?? "New session"
       },
       include: {
@@ -1816,7 +2111,448 @@ export async function registerWorkspaceRoutes(server: FastifyInstance) {
       session: buildSessionRecord({
         ...session,
         sessionWorktree: null
-      })
+      }, user.id, null)
     });
+  });
+
+  server.patch("/sessions/:sessionId", async (request, reply) => {
+    const user = await getSessionUser(request.cookies.hawkcode_session);
+    if (!user) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+
+    const sessionId = (request.params as { sessionId: string }).sessionId;
+    const parsed = updateSessionBodySchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({
+        error: "invalid_request",
+        details: parsed.error.flatten()
+      });
+    }
+
+    try {
+      const session = await getAuthorizedSession({
+        sessionId,
+        userId: user.id,
+        memberships: user.memberships
+      });
+      if (session.ownerId !== user.id) {
+        return reply.code(403).send({ error: "forbidden" });
+      }
+
+      const updated = await prisma.session.update({
+        where: {
+          id: session.id
+        },
+        data: {
+          title: parsed.data.title.trim()
+        },
+        include: {
+          project: {
+            select: {
+              id: true,
+              name: true
+            }
+          },
+          messages: {
+            orderBy: {
+              createdAt: "asc"
+            }
+          },
+          agentRuns: {
+            orderBy: {
+              createdAt: "desc"
+            },
+            take: 1,
+            include: {
+              toolCalls: {
+                where: {
+                  name: "generate_reply"
+                },
+                orderBy: {
+                  id: "desc"
+                },
+                take: 1
+              }
+            }
+          }
+        }
+      });
+
+      return reply.send({
+        session: buildSessionRecord({
+          ...updated,
+          sessionWorktree: session.sessionWorktree
+        }, user.id, null)
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message === "session_not_found") {
+        return reply.code(404).send({ error: "session_not_found" });
+      }
+      if (error instanceof Error && error.message === "forbidden") {
+        return reply.code(403).send({ error: "forbidden" });
+      }
+
+      request.log.error(error);
+      return reply.code(500).send({
+        error: "session_update_failed"
+      });
+    }
+  });
+
+  server.patch("/sessions/:sessionId/sharing", async (request, reply) => {
+    const user = await getSessionUser(request.cookies.hawkcode_session);
+    if (!user) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+
+    const sessionId = (request.params as { sessionId: string }).sessionId;
+    const parsed = updateSessionSharingBodySchema.safeParse(request.body);
+    if (!parsed.success) {
+      return reply.code(400).send({
+        error: "invalid_request",
+        details: parsed.error.flatten()
+      });
+    }
+
+    try {
+      const session = await getAuthorizedSession({
+        sessionId,
+        userId: user.id,
+        memberships: user.memberships
+      });
+      if (session.ownerId !== user.id) {
+        return reply.code(403).send({ error: "forbidden" });
+      }
+
+      const updated = await prisma.session.update({
+        where: {
+          id: session.id
+        },
+        data: {
+          sharedWithWorkspace: parsed.data.sharedWithWorkspace
+        },
+        include: {
+          project: {
+            select: {
+              id: true,
+              name: true
+            }
+          },
+          messages: {
+            orderBy: {
+              createdAt: "asc"
+            }
+          },
+          agentRuns: {
+            orderBy: {
+              createdAt: "desc"
+            },
+            take: 1,
+            include: {
+              toolCalls: {
+                where: {
+                  name: "generate_reply"
+                },
+                orderBy: {
+                  id: "desc"
+                },
+                take: 1
+              }
+            }
+          }
+        }
+      });
+
+      return reply.send({
+        session: buildSessionRecord({
+          ...updated,
+          sessionWorktree: session.sessionWorktree
+        }, user.id, null)
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message === "session_not_found") {
+        return reply.code(404).send({ error: "session_not_found" });
+      }
+      if (error instanceof Error && error.message === "forbidden") {
+        return reply.code(403).send({ error: "forbidden" });
+      }
+
+      request.log.error(error);
+      return reply.code(500).send({
+        error: "session_sharing_update_failed"
+      });
+    }
+  });
+
+  server.post("/sessions/:sessionId/checkout", async (request, reply) => {
+    const user = await getSessionUser(request.cookies.hawkcode_session);
+    if (!user) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+
+    const sessionId = (request.params as { sessionId: string }).sessionId;
+    const parsed = sessionCheckoutBodySchema.safeParse(request.body ?? {});
+    if (!parsed.success) {
+      return reply.code(400).send({
+        error: "invalid_request",
+        details: parsed.error.flatten()
+      });
+    }
+
+    try {
+      const session = await getAuthorizedSession({
+        sessionId,
+        userId: user.id,
+        memberships: user.memberships
+      });
+      const activeCheckout = getActiveCheckout(session);
+      if (activeCheckout && activeCheckout.checkedOutById !== user.id) {
+        const checkoutUser = await prisma.user.findUnique({
+          where: {
+            id: activeCheckout.checkedOutById
+          },
+          select: {
+            email: true
+          }
+        });
+        return reply.code(409).send({
+          error: "session_checked_out",
+          message: `Session is currently checked out by ${checkoutUser?.email ?? "another user"}.`
+        });
+      }
+
+      const extendMinutes = parsed.data.extendMinutes ?? DEFAULT_SESSION_CHECKOUT_MINUTES;
+      const updated = await prisma.session.update({
+        where: {
+          id: session.id
+        },
+        data: {
+          checkedOutById: user.id,
+          checkoutExpiresAt: getCheckoutExpiry(extendMinutes)
+        },
+        include: {
+          project: {
+            select: {
+              id: true,
+              name: true
+            }
+          },
+          messages: {
+            orderBy: {
+              createdAt: "asc"
+            }
+          },
+          agentRuns: {
+            orderBy: {
+              createdAt: "desc"
+            },
+            take: 1,
+            include: {
+              toolCalls: {
+                where: {
+                  name: "generate_reply"
+                },
+                orderBy: {
+                  id: "desc"
+                },
+                take: 1
+              }
+            }
+          }
+        }
+      });
+
+      return reply.send({
+        session: buildSessionRecord({
+          ...updated,
+          sessionWorktree: session.sessionWorktree
+        }, user.id, user.email)
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message === "session_not_found") {
+        return reply.code(404).send({ error: "session_not_found" });
+      }
+      if (error instanceof Error && error.message === "forbidden") {
+        return reply.code(403).send({ error: "forbidden" });
+      }
+
+      request.log.error(error);
+      return reply.code(500).send({
+        error: "session_checkout_failed"
+      });
+    }
+  });
+
+  server.delete("/sessions/:sessionId/checkout", async (request, reply) => {
+    const user = await getSessionUser(request.cookies.hawkcode_session);
+    if (!user) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+
+    const sessionId = (request.params as { sessionId: string }).sessionId;
+
+    try {
+      const session = await getAuthorizedSession({
+        sessionId,
+        userId: user.id,
+        memberships: user.memberships
+      });
+      const activeCheckout = getActiveCheckout(session);
+      if (activeCheckout && activeCheckout.checkedOutById !== user.id && session.ownerId !== user.id) {
+        return reply.code(403).send({ error: "forbidden" });
+      }
+
+      const updated = activeCheckout
+        ? await prisma.session.update({
+            where: {
+              id: session.id
+            },
+            data: {
+              checkedOutById: null,
+              checkoutExpiresAt: null
+            },
+            include: {
+              project: {
+                select: {
+                  id: true,
+                  name: true
+                }
+              },
+              messages: {
+                orderBy: {
+                  createdAt: "asc"
+                }
+              },
+              agentRuns: {
+                orderBy: {
+                  createdAt: "desc"
+                },
+                take: 1,
+                include: {
+                  toolCalls: {
+                    where: {
+                      name: "generate_reply"
+                    },
+                    orderBy: {
+                      id: "desc"
+                    },
+                    take: 1
+                  }
+                }
+              }
+            }
+          })
+        : await prisma.session.findUniqueOrThrow({
+            where: {
+              id: session.id
+            },
+            include: {
+              project: {
+                select: {
+                  id: true,
+                  name: true
+                }
+              },
+              messages: {
+                orderBy: {
+                  createdAt: "asc"
+                }
+              },
+              agentRuns: {
+                orderBy: {
+                  createdAt: "desc"
+                },
+                take: 1,
+                include: {
+                  toolCalls: {
+                    where: {
+                      name: "generate_reply"
+                    },
+                    orderBy: {
+                      id: "desc"
+                    },
+                    take: 1
+                  }
+                }
+              }
+            }
+          });
+
+      return reply.send({
+        session: buildSessionRecord({
+          ...updated,
+          sessionWorktree: session.sessionWorktree
+        }, user.id, null)
+      });
+    } catch (error) {
+      if (error instanceof Error && error.message === "session_not_found") {
+        return reply.code(404).send({ error: "session_not_found" });
+      }
+      if (error instanceof Error && error.message === "forbidden") {
+        return reply.code(403).send({ error: "forbidden" });
+      }
+
+      request.log.error(error);
+      return reply.code(500).send({
+        error: "session_checkout_release_failed"
+      });
+    }
+  });
+
+  server.delete("/sessions/:sessionId", async (request, reply) => {
+    const user = await getSessionUser(request.cookies.hawkcode_session);
+    if (!user) {
+      return reply.code(401).send({ error: "unauthorized" });
+    }
+
+    const sessionId = (request.params as { sessionId: string }).sessionId;
+
+    try {
+      const session = await getAuthorizedSession({
+        sessionId,
+        userId: user.id,
+        memberships: user.memberships
+      });
+      if (session.ownerId !== user.id) {
+        return reply.code(403).send({ error: "forbidden" });
+      }
+
+      const hasExternalContributors =
+        session.sharedWithWorkspace &&
+        (await prisma.message.findFirst({
+          where: {
+            sessionId: session.id,
+            authorId: {
+              not: session.ownerId
+            }
+          },
+          select: {
+            id: true
+          }
+        }));
+
+      if (hasExternalContributors) {
+        return reply.code(409).send({
+          error: "session_delete_blocked",
+          message: "A shared workspace member has already contributed to this session."
+        });
+      }
+
+      await deleteSessionResources(session.id);
+      return reply.code(204).send();
+    } catch (error) {
+      if (error instanceof Error && error.message === "session_not_found") {
+        return reply.code(404).send({ error: "session_not_found" });
+      }
+      if (error instanceof Error && error.message === "forbidden") {
+        return reply.code(403).send({ error: "forbidden" });
+      }
+
+      request.log.error(error);
+      return reply.code(500).send({
+        error: "session_delete_failed"
+      });
+    }
   });
 }

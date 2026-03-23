@@ -79,6 +79,20 @@ function buildGitHubAccountRecord(account?: {
   };
 }
 
+function buildMembershipRecord(membership: {
+  role: string;
+  workspace: {
+    id: string;
+    name: string;
+  };
+}) {
+  return {
+    role: membership.role,
+    workspaceId: membership.workspace.id,
+    workspaceName: membership.workspace.name
+  };
+}
+
 export async function registerAuthRoutes(server: FastifyInstance) {
   server.get("/auth/invite/:token", async (request, reply) => {
     const token = (request.params as { token: string }).token;
@@ -276,24 +290,32 @@ export async function registerAuthRoutes(server: FastifyInstance) {
   });
 
   server.get("/auth/me", async (request, reply) => {
-    const token = request.cookies.hawkcode_session;
-    if (!token) {
+    const user = await getSessionUser(request.cookies.hawkcode_session);
+    if (!user) {
       return reply.code(401).send({ error: "unauthorized" });
     }
-    const session = await prisma.authSession.findUnique({
-      where: { token },
-      include: { user: true }
+
+    const memberships = await prisma.membership.findMany({
+      where: {
+        userId: user.id
+      },
+      orderBy: {
+        createdAt: "asc"
+      },
+      include: {
+        workspace: {
+          select: {
+            id: true,
+            name: true
+          }
+        }
+      }
     });
-    if (!session) {
-      reply.clearCookie("hawkcode_session", { path: "/" });
-      return reply.code(401).send({ error: "unauthorized" });
-    }
-    if (session.expiresAt < new Date()) {
-      await prisma.authSession.delete({ where: { id: session.id } });
-      reply.clearCookie("hawkcode_session", { path: "/" });
-      return reply.code(401).send({ error: "session_expired" });
-    }
-    return reply.send({ user: { id: session.user.id, email: session.user.email } });
+
+    return reply.send({
+      user: { id: user.id, email: user.email },
+      memberships: memberships.map(buildMembershipRecord)
+    });
   });
 
   server.get("/auth/github/status", async (request, reply) => {
